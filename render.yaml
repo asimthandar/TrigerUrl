@@ -1,0 +1,26 @@
+services:
+  - type: web
+    name: berlin-x-panel
+    runtime: python
+    buildCommand: "python --version"
+    startCommand: "python server.py"
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.11.9"
+      - key: ADMIN_USER
+        sync: false
+      - key: ADMIN_PASSWORD
+        sync: false
+      - key: MAX_APK_MB
+        value: "150"
+      - key: DATA_DIR
+        value: "/var/data"
+
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_ADMIN_CHAT_ID
+        sync: false
+      - key: TELEGRAM_PANEL_BASE
+        value: "http://127.0.0.1:10000"
+      - key: TELEGRAM_REPORT_INTERVAL
+        value: "1800"

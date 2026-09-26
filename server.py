@@ -1,0 +1,2127 @@
+#!/usr/bin/env python3
+"""
+BERLIN X PANEL — advanced multi-user backend.
+
+ADVANCED FEATURES
+─────────────────
+• WAL-mode SQLite + parallel workers
+• Circuit breaker — skip dead hosts
+• LRU cache — dedupe recent probes
+• Job retry + pause/resume
+• Metrics endpoint
+• Structured logging (JSON optional)
+• Domain stats per host
+• Graceful shutdown
+• Per-endpoint rate limiting
+• Bounded Firebase probe (never downloads full DB)
+"""
+from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
+from urllib.parse import urlparse, parse_qs, parse_qsl, urlencode
+from pathlib import Path
+from collections import OrderedDict
+from datetime import datetime, timezone
+import hashlib, json, os, secrets, sqlite3, time, threading, re
+import http.client, csv, signal, sys
+
+# ─────────────── CONFIG ───────────────
+
+ROOT = Path(__file__).resolve().parent
+DATA_DIR = Path(os.environ.get("DATA_DIR", str(ROOT / "data"))).expanduser()
+APK_DIR = DATA_DIR / "apks"
+DB_PATH = DATA_DIR / "panel.db"
+
+HOST = os.environ.get("HOST", "0.0.0.0")
+PORT = int(os.environ.get("PORT", "10000"))
+ADMIN_USER = os.environ.get("ADMIN_USER", "admin")
+ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "")
+MAX_APK_MB = max(1, int(os.environ.get("MAX_APK_MB", "150")))
+MAX_APK_BYTES = MAX_APK_MB * 1024 * 1024
+SESSION_TTL = 12 * 60 * 60
+
+# Public bulk rate limit
+PUBLIC_BULK_WINDOW = 300
+PUBLIC_BULK_LIMIT = 20
+PUBLIC_BULK_RATE: dict = {}
+
+# Bulk worker config
+BULK_WORKERS = max(1, min(8, int(os.environ.get("BULK_WORKERS", "4"))))
+BULK_MAX_URLS = max(1, min(5000, int(os.environ.get("BULK_MAX_URLS", "2000"))))
+BULK_MAX_BYTES = max(1024, min(2_000_000, int(os.environ.get("BULK_MAX_BYTES", "300000"))))
+BULK_TIMEOUT = max(2, min(20, int(os.environ.get("BULK_TIMEOUT", "8"))))
+BULK_RETRY_MAX = max(0, min(5, int(os.environ.get("BULK_RETRY_MAX", "2"))))
+BULK_EXTRA_SUFFIXES = tuple(
+    x.strip().lower().lstrip(".")
+    for x in os.environ.get("FIREBASE_ALLOWED_HOST_SUFFIXES", "").split(",")
+    if x.strip()
+)
+
+# Circuit breaker
+CB_FAIL_THRESHOLD = max(2, int(os.environ.get("CB_FAIL_THRESHOLD", "5")))
+CB_COOLDOWN_SEC   = max(30, int(os.environ.get("CB_COOLDOWN_SEC", "300")))
+
+# LRU cache
+CACHE_TTL_SEC   = max(10, int(os.environ.get("CACHE_TTL_SEC", "60")))
+CACHE_MAX_ITEMS = max(50, int(os.environ.get("CACHE_MAX_ITEMS", "2000")))
+
+# Logging
+LOG_FORMAT = os.environ.get("LOG_FORMAT", "text").lower()  # text | json
+API_TRACE_ENABLED = os.environ.get("API_TRACE", "1").lower() not in {"0", "false", "no", "off"}
+
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+APK_DIR.mkdir(parents=True, exist_ok=True)
+
+# ─────────────── TELEGRAM HOOK (safe import) ───────────────
+
+try:
+    import telegram_bot as _tg
+except Exception as _exc:
+    _tg = None
+    print(f"[TELEGRAM] module not loaded: {type(_exc).__name__}", flush=True)
+
+def _tg_notify_active(url, job_id=None, source="public-bulk", meta=None):
+    if _tg is None:
+        return
+    try:
+        _tg.notify_active_url(url=url, job_id=job_id, source=source, meta=meta or {})
+    except Exception as exc:
+        log(f"[TELEGRAM] notify failed: {type(exc).__name__}", level="WARN")
+
+# ─────────────── STRUCTURED LOGGING ───────────────
+
+_LEVEL_ORDER = {"DEBUG": 10, "INFO": 20, "WARN": 30, "ERROR": 40}
+_LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
+
+def _emit(level: str, message: str, extra: dict = None):
+    if _LEVEL_ORDER.get(level, 20) < _LEVEL_ORDER.get(_LOG_LEVEL, 20):
+        return
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+    if LOG_FORMAT == "json":
+        record = {"ts": ts, "level": level, "msg": message}
+        if extra: record.update(extra)
+        print(json.dumps(record), flush=True)
+    else:
+        prefix = f"[{ts}] [{level}]"
+        line = f"{prefix} {message}"
+        if extra:
+            kv = " ".join(f"{k}={v}" for k, v in extra.items())
+            line = f"{line} | {kv}"
+        print(line, flush=True)
+
+def log(message: str, level: str = "INFO", **extra):
+    _emit(level, message, extra or None)
+
+def log_bulk(message: str):
+    _emit("INFO", message, {"tag": "BULK"})
+
+# ─────────────── GLOBAL STATE ───────────────
+
+_START_TIME = time.time()
+_STATS = {
+    "requests_total": 0,
+    "requests_by_status": {},   # {"200": 12, "404": 3}
+    "bulk_jobs_created": 0,
+    "bulk_items_checked": 0,
+    "bulk_items_active": 0,
+    "notify_calls": 0,
+    "notify_success": 0,
+    "shutdown_requested": False,
+}
+_STATS_LOCK = threading.Lock()
+
+def _bump(key: str, n: int = 1):
+    with _STATS_LOCK:
+        _STATS[key] = _STATS.get(key, 0) + n
+
+def _bump_status(code: int):
+    with _STATS_LOCK:
+        m = _STATS.setdefault("requests_by_status", {})
+        k = str(code)
+        m[k] = m.get(k, 0) + 1
+
+def _snapshot_stats() -> dict:
+    with _STATS_LOCK:
+        return {
+            **_STATS,
+            "requests_by_status": dict(_STATS.get("requests_by_status", {})),
+            "uptime_sec": int(time.time() - _START_TIME),
+        }
+# ═══════════════════════════════════════════════════════════════════
+# DATABASE (WAL + advanced schema)
+# ═══════════════════════════════════════════════════════════════════
+
+def get_db():
+    con = sqlite3.connect(DB_PATH, timeout=30.0, check_same_thread=False)
+    con.row_factory = sqlite3.Row
+    # ── Multi-user safety ──
+    con.execute("PRAGMA journal_mode=WAL")
+    con.execute("PRAGMA synchronous=NORMAL")
+    con.execute("PRAGMA busy_timeout=30000")
+    con.execute("PRAGMA foreign_keys=ON")
+    con.execute("PRAGMA temp_store=MEMORY")
+    con.execute("PRAGMA mmap_size=268435456")
+
+    # ── apps table ──
+    con.execute("""
+      CREATE TABLE IF NOT EXISTS apps (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        app_name TEXT NOT NULL, owner_name TEXT NOT NULL, owner_email TEXT NOT NULL,
+        firebase_project_id TEXT, firebase_database_url TEXT,
+        firebase_auth_domain TEXT, firebase_storage_bucket TEXT,
+        firebase_messaging_sender_id TEXT, firebase_app_id TEXT,
+        firebase_config_json TEXT,
+        apk_original_name TEXT, apk_stored_name TEXT,
+        apk_size INTEGER NOT NULL DEFAULT 0, apk_sha256 TEXT,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        status TEXT NOT NULL DEFAULT 'active'
+      )
+    """)
+
+    # ── connections table ──
+    con.execute("""
+      CREATE TABLE IF NOT EXISTS connections (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        firebase_database_url TEXT NOT NULL,
+        key_present INTEGER NOT NULL DEFAULT 0,
+        key_fingerprint TEXT,
+        login_type TEXT NOT NULL DEFAULT 'Firebase connection',
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+      )
+    """)
+
+    # ── bulk_jobs table (with retry_count, priority) ──
+    con.execute("""
+      CREATE TABLE IF NOT EXISTS bulk_jobs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        filename TEXT NOT NULL,
+        total INTEGER NOT NULL DEFAULT 0,
+        processed INTEGER NOT NULL DEFAULT 0,
+        active INTEGER NOT NULL DEFAULT 0,
+        inactive INTEGER NOT NULL DEFAULT 0,
+        no_data INTEGER NOT NULL DEFAULT 0,
+        unreachable INTEGER NOT NULL DEFAULT 0,
+        status TEXT NOT NULL DEFAULT 'pending',
+        priority INTEGER NOT NULL DEFAULT 0,
+        retry_count INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        started_at TEXT, completed_at TEXT, error TEXT,
+        public_token TEXT UNIQUE
+      )
+    """)
+
+    # ── bulk_job_items table (with retry fields) ──
+    con.execute("""
+      CREATE TABLE IF NOT EXISTS bulk_job_items (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        job_id INTEGER NOT NULL,
+        url TEXT NOT NULL,
+        secret TEXT,
+        status TEXT NOT NULL DEFAULT 'pending',
+        http_status INTEGER,
+        error TEXT,
+        retry_count INTEGER NOT NULL DEFAULT 0,
+        latency_ms INTEGER,
+        checked_at TEXT,
+        FOREIGN KEY(job_id) REFERENCES bulk_jobs(id) ON DELETE CASCADE
+      )
+    """)
+
+    # ── domain_stats table (per-host success/failure) ──
+    con.execute("""
+      CREATE TABLE IF NOT EXISTS domain_stats (
+        host TEXT PRIMARY KEY,
+        total_checks INTEGER NOT NULL DEFAULT 0,
+        active_count INTEGER NOT NULL DEFAULT 0,
+        inactive_count INTEGER NOT NULL DEFAULT 0,
+        no_data_count INTEGER NOT NULL DEFAULT 0,
+        unreachable_count INTEGER NOT NULL DEFAULT 0,
+        last_status TEXT,
+        last_check_at TEXT,
+        avg_latency_ms INTEGER
+      )
+    """)
+
+    # ── circuit_breaker state (persisted) ──
+    con.execute("""
+      CREATE TABLE IF NOT EXISTS circuit_breaker (
+        host TEXT PRIMARY KEY,
+        fail_count INTEGER NOT NULL DEFAULT 0,
+        opened_at REAL,
+        last_fail_at REAL
+      )
+    """)
+
+    # ── Migrations: bulk_jobs ──
+    cols = {r[1] for r in con.execute('PRAGMA table_info(bulk_jobs)').fetchall()}
+    for _col, _ddl in (
+        ('no_data',      'INTEGER NOT NULL DEFAULT 0'),
+        ('unreachable',  'INTEGER NOT NULL DEFAULT 0'),
+        ('priority',     'INTEGER NOT NULL DEFAULT 0'),
+        ('retry_count',  'INTEGER NOT NULL DEFAULT 0'),
+    ):
+        if _col not in cols:
+            con.execute(f'ALTER TABLE bulk_jobs ADD COLUMN {_col} {_ddl}')
+    if 'public_token' not in cols:
+        con.execute('ALTER TABLE bulk_jobs ADD COLUMN public_token TEXT')
+        for r in con.execute('SELECT id FROM bulk_jobs WHERE public_token IS NULL').fetchall():
+            con.execute('UPDATE bulk_jobs SET public_token=? WHERE id=?',
+                        (secrets.token_urlsafe(24), r[0]))
+
+    # ── Migrations: bulk_job_items ──
+    item_cols = {r[1] for r in con.execute('PRAGMA table_info(bulk_job_items)').fetchall()}
+    for _col, _ddl in (
+        ('secret',       'TEXT'),
+        ('retry_count',  'INTEGER NOT NULL DEFAULT 0'),
+        ('latency_ms',   'INTEGER'),
+    ):
+        if _col not in item_cols:
+            con.execute(f'ALTER TABLE bulk_job_items ADD COLUMN {_col} {_ddl}')
+
+    # ── Indexes (advanced) ──
+    con.execute("CREATE INDEX IF NOT EXISTS idx_jobs_status ON bulk_jobs(status)")
+    con.execute("CREATE INDEX IF NOT EXISTS idx_jobs_priority ON bulk_jobs(priority DESC, id ASC)")
+    con.execute("CREATE INDEX IF NOT EXISTS idx_items_job_status ON bulk_job_items(job_id, status)")
+    con.execute("CREATE INDEX IF NOT EXISTS idx_items_status ON bulk_job_items(status)")
+    con.execute("CREATE INDEX IF NOT EXISTS idx_items_url ON bulk_job_items(url)")
+    con.execute("CREATE INDEX IF NOT EXISTS idx_domain_last ON domain_stats(last_check_at)")
+
+    con.commit()
+    return con
+
+# Initialize DB (once at startup)
+get_db().close()
+
+# ═══════════════════════════════════════════════════════════════════
+# CIRCUIT BREAKER (per-host)
+# ═══════════════════════════════════════════════════════════════════
+
+_CB_LOCK = threading.Lock()
+_CB_STATE: dict = {}   # host -> {"fails": int, "opened_at": float, "last_fail": float}
+
+def _cb_load_from_db():
+    """Load persisted circuit breaker state on startup."""
+    try:
+        con = get_db()
+        rows = con.execute("SELECT * FROM circuit_breaker").fetchall()
+        con.close()
+        with _CB_LOCK:
+            for r in rows:
+                _CB_STATE[r["host"]] = {
+                    "fails": r["fail_count"] or 0,
+                    "opened_at": r["opened_at"],
+                    "last_fail": r["last_fail_at"],
+                }
+    except Exception as exc:
+        log(f"circuit breaker load failed: {type(exc).__name__}", level="WARN")
+
+def _cb_persist(host: str, state: dict):
+    """Persist circuit breaker state."""
+    def _do(c):
+        c.execute("""
+          INSERT INTO circuit_breaker(host, fail_count, opened_at, last_fail_at)
+          VALUES(?,?,?,?)
+          ON CONFLICT(host) DO UPDATE SET
+            fail_count=excluded.fail_count,
+            opened_at=excluded.opened_at,
+            last_fail_at=excluded.last_fail_at
+        """, (host, state.get("fails", 0),
+              state.get("opened_at"), state.get("last_fail")))
+    try:
+        _db_retry(_do, attempts=2, delay=0.1)
+    except Exception:
+        pass
+
+def cb_is_open(host: str) -> bool:
+    """Return True if host's circuit is open (should skip)."""
+    now = time.time()
+    with _CB_LOCK:
+        st = _CB_STATE.get(host)
+        if not st:
+            return False
+        if st.get("opened_at") is None:
+            return False
+        if now - st["opened_at"] >= CB_COOLDOWN_SEC:
+            # cooldown passed → half-open → reset fails
+            st["fails"] = 0
+            st["opened_at"] = None
+            return False
+        return True
+
+def cb_record_fail(host: str):
+    """Record a failure. Opens circuit if threshold reached."""
+    now = time.time()
+    with _CB_LOCK:
+        st = _CB_STATE.setdefault(host, {"fails": 0, "opened_at": None, "last_fail": 0})
+        st["fails"] += 1
+        st["last_fail"] = now
+        if st["fails"] >= CB_FAIL_THRESHOLD and not st["opened_at"]:
+            st["opened_at"] = now
+            log(f"circuit OPEN for {host} (fails={st['fails']})", level="WARN")
+        snapshot = dict(st)
+    _cb_persist(host, snapshot)
+
+def cb_record_success(host: str):
+    """Record a success → reset failure count."""
+    with _CB_LOCK:
+        st = _CB_STATE.get(host)
+        if not st: return
+        if st.get("fails", 0) == 0 and st.get("opened_at") is None:
+            return
+        st["fails"] = 0
+        st["opened_at"] = None
+        snapshot = dict(st)
+    _cb_persist(host, snapshot)
+
+def cb_snapshot() -> dict:
+    with _CB_LOCK:
+        return {h: dict(s) for h, s in _CB_STATE.items() if s.get("opened_at") or s.get("fails")}
+
+# ═══════════════════════════════════════════════════════════════════
+# LRU CACHE (probe results)
+# ═══════════════════════════════════════════════════════════════════
+
+_CACHE_LOCK = threading.Lock()
+_CACHE: "OrderedDict[str, tuple]" = OrderedDict()   # key -> (ts, result)
+
+def cache_get(key: str):
+    now = time.time()
+    with _CACHE_LOCK:
+        item = _CACHE.get(key)
+        if not item: return None
+        ts, result = item
+        if now - ts > CACHE_TTL_SEC:
+            _CACHE.pop(key, None)
+            return None
+        _CACHE.move_to_end(key)
+        return result
+
+def cache_set(key: str, result):
+    with _CACHE_LOCK:
+        _CACHE[key] = (time.time(), result)
+        _CACHE.move_to_end(key)
+        while len(_CACHE) > CACHE_MAX_ITEMS:
+            _CACHE.popitem(last=False)
+
+def cache_snapshot() -> dict:
+    with _CACHE_LOCK:
+        return {"size": len(_CACHE), "max": CACHE_MAX_ITEMS, "ttl_sec": CACHE_TTL_SEC}
+
+# ═══════════════════════════════════════════════════════════════════
+# DOMAIN STATS
+# ═══════════════════════════════════════════════════════════════════
+
+def _domain_stats_update(host: str, status: str, latency_ms: int):
+    """Update domain stats table."""
+    col_map = {
+        "active": "active_count",
+        "inactive": "inactive_count",
+        "invalid_no_data": "no_data_count",
+        "unreachable": "unreachable_count",
+        "response_too_large": "unreachable_count",
+    }
+    col = col_map.get(status, "unreachable_count")
+
+    def _do(c):
+        c.execute("""
+          INSERT INTO domain_stats(host, total_checks, last_status, last_check_at)
+          VALUES(?, 1, ?, CURRENT_TIMESTAMP)
+          ON CONFLICT(host) DO UPDATE SET
+            total_checks = total_checks + 1,
+            last_status = excluded.last_status,
+            last_check_at = CURRENT_TIMESTAMP
+        """, (host, status))
+        c.execute(f"UPDATE domain_stats SET {col} = {col} + 1 WHERE host=?", (host,))
+        if latency_ms and latency_ms > 0:
+            c.execute("""
+              UPDATE domain_stats
+              SET avg_latency_ms = (
+                CASE
+                  WHEN avg_latency_ms IS NULL THEN ?
+                  ELSE (avg_latency_ms * 9 + ?) / 10
+                END
+              )
+              WHERE host = ?
+            """, (latency_ms, latency_ms, host))
+
+    try:
+        _db_retry(_do, attempts=2, delay=0.1)
+    except Exception as exc:
+        log(f"domain stats update failed: {type(exc).__name__}", level="WARN")
+# ═══════════════════════════════════════════════════════════════════
+# HELPERS
+# ═══════════════════════════════════════════════════════════════════
+
+def terminal_log(msg):
+    _emit("INFO", msg, {"tag": "TERM"})
+
+def safe_url(url):
+    u = urlparse(url)
+    return f"https://{u.hostname or '-'}{u.path or '/'}"
+
+def _host_allowed(host):
+    host = (host or "").lower().rstrip(".")
+    return (host.endswith(".firebaseio.com")
+            or host.endswith(".firebasedatabase.app")
+            or any(host.endswith(s if s.startswith(".") else "." + s)
+                   or host == s.lstrip(".") for s in BULK_EXTRA_SUFFIXES))
+
+def _redact_secret(secret):
+    if not secret: return "-"
+    s = str(secret)
+    return "***" if len(s) <= 8 else f"{s[:4]}…{s[-2:]}({len(s)}c)"
+
+def normalize_bulk_urls(raw_text):
+    """Returns list of (url, secret)."""
+    seen, urls = set(), []
+    for raw in raw_text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"): continue
+        if re.match(r"^url\s*,\s*secret_key\s*$", line, re.I): continue
+        try: row = next(csv.reader([line]))
+        except Exception: row = [line]
+        candidate = (row[0] if row else "").strip()
+        secret = (row[1].strip() if len(row) > 1 else "") or None
+        if not candidate or len(candidate) > 500: continue
+        u = urlparse(candidate)
+        host = (u.hostname or "").lower().rstrip(".")
+        if u.scheme.lower() != "https" or not host or not _host_allowed(host): continue
+        canonical = (f"https://{host}"
+                     + ((f":{u.port}") if u.port and u.port not in (443,) else "")
+                     + (u.path.rstrip("/") or ""))
+        if canonical not in seen:
+            seen.add(canonical)
+            urls.append((canonical, secret))
+        if len(urls) >= BULK_MAX_URLS: break
+    return urls
+
+def _response_has_data(body):
+    if not body or not body.strip(): return False, None, "Empty response"
+    try: parsed = json.loads(body.decode("utf-8", errors="strict"))
+    except Exception: return False, None, "Invalid JSON"
+    if parsed in (None, "", {}, [], False, 0): return False, parsed, "No data"
+    return True, parsed, None
+
+def _firebase_probe_path(u, secret=None):
+    base = u.path or "/"
+    if not base.endswith(".json"):
+        base = base.rstrip("/") + "/.json" if base != "/" else "/.json"
+    query = [(k, v) for k, v in parse_qsl(u.query, keep_blank_values=True)
+             if k.lower() not in {"orderby", "limittofirst"}]
+    query.extend([("orderBy", '"$key"'), ("limitToFirst", "1")])
+    if secret: query.append(("auth", str(secret)))
+    return base + "?" + urlencode(query)
+
+def _cache_key(url: str, secret: Optional[str]) -> str:
+    """Cache key — includes secret hash so different secrets don't collide."""
+    if not secret:
+        return url
+    sh = hashlib.sha256(str(secret).encode()).hexdigest()[:12]
+    return f"{url}#auth={sh}"
+
+# ═══════════════════════════════════════════════════════════════════
+# FIREBASE HEALTH PROBE (with cache + circuit breaker)
+# ═══════════════════════════════════════════════════════════════════
+
+def check_firebase_reachability(url, secret=None):
+    """
+    Bounded Firebase RTDB health probe.
+    - Checks LRU cache first
+    - Skips if circuit breaker is open
+    - Records per-host stats
+    """
+    started = time.time()
+    u = urlparse(url)
+    host = (u.hostname or '').lower()
+    terminal_log(f"[BULK] CHECK {safe_url(url)}")
+
+    # ── Validate URL ──
+    if u.scheme != 'https':
+        terminal_log(f"[BULK] RESULT {safe_url(url)} -> INACTIVE | HTTPS required")
+        _domain_stats_update(host, "inactive", 0)
+        return 'inactive', None, 'HTTPS required'
+    if not _host_allowed(host):
+        terminal_log(f"[BULK] RESULT {safe_url(url)} -> INACTIVE | Host not allowed")
+        _domain_stats_update(host, "inactive", 0)
+        return 'inactive', None, 'Host not allowed'
+
+    # ── Cache lookup ──
+    ck = _cache_key(url, secret)
+    cached = cache_get(ck)
+    if cached:
+        status, code, err, cached_latency = cached
+        terminal_log(f"[BULK] RESULT {safe_url(url)} -> {status.upper()} | (cached)")
+        return status, code, err
+
+    # ── Circuit breaker check ──
+    if cb_is_open(host):
+        terminal_log(f"[BULK] RESULT {safe_url(url)} -> UNREACHABLE | circuit open")
+        _domain_stats_update(host, "unreachable", 0)
+        return 'unreachable', None, 'Circuit breaker open (too many failures)'
+
+    # ── Do the probe ──
+    conn = None
+    result_status = 'unreachable'
+    result_code = None
+    result_error = 'Unknown error'
+    latency_ms = 0
+
+    try:
+        conn = http.client.HTTPSConnection(host, u.port or 443, timeout=BULK_TIMEOUT)
+        path = _firebase_probe_path(u, secret)
+        auth_tag = f" [auth={_redact_secret(secret)}]" if secret else ""
+        terminal_log(f"[BULK] PROBE {safe_url(url)}?limitToFirst=1{auth_tag}")
+
+        probe_start = time.time()
+        conn.request('GET', path, headers={
+            'Accept': 'application/json',
+            'User-Agent': 'BERLIN-X-PANEL/7.0',
+            'Connection': 'close',
+        })
+        resp = conn.getresponse()
+        code = resp.status
+        result_code = code
+        latency_ms = int((time.time() - probe_start) * 1000)
+
+        # ── Non-200 ──
+        if code != 200:
+            resp.read(16 * 1024)
+            labels = {
+                401: 'AUTH REQUIRED',
+                403: 'FORBIDDEN',
+                404: 'NOT FOUND',
+                423: 'DEACTIVATED / LOCKED',
+                429: 'RATE LIMITED',
+            }
+            result = labels.get(code) or ('SERVER ERROR' if 500 <= code <= 599 else f'HTTP {code}')
+            result_status = 'inactive'
+            result_error = f'HTTP {code} ({result})'
+            terminal_log(f"[BULK] RESULT {safe_url(url)} -> INACTIVE | HTTP {code} | {result}")
+            cb_record_success(host)  # got a response, host is alive
+            _domain_stats_update(host, "inactive", latency_ms)
+            cache_set(ck, (result_status, result_code, result_error, latency_ms))
+            return result_status, result_code, result_error
+
+        # ── Bounded read ──
+        max_probe = 64 * 1024
+        chunks, total = [], 0
+        while total <= max_probe:
+            chunk = resp.read(min(8192, max_probe + 1 - total))
+            if not chunk: break
+            chunks.append(chunk); total += len(chunk)
+            if total > max_probe:
+                result_status = 'response_too_large'
+                result_error = 'Bounded probe response exceeded 64KB'
+                terminal_log(f"[BULK] RESULT {safe_url(url)} -> RESPONSE TOO LARGE")
+                cb_record_success(host)
+                _domain_stats_update(host, "response_too_large", latency_ms)
+                cache_set(ck, (result_status, result_code, result_error, latency_ms))
+                return result_status, result_code, result_error
+
+        # ── Parse body ──
+        body = b''.join(chunks)
+        has_data, _parsed, data_error = _response_has_data(body)
+        if not has_data:
+            result_status = 'invalid_no_data'
+            result_error = data_error or 'No data'
+            terminal_log(f"[BULK] RESULT {safe_url(url)} -> INVALID / NO DATA | {result_error}")
+            cb_record_success(host)
+            _domain_stats_update(host, "invalid_no_data", latency_ms)
+            cache_set(ck, (result_status, result_code, result_error, latency_ms))
+            return result_status, result_code, result_error
+
+        # ── SUCCESS ──
+        result_status = 'active'
+        result_error = 'HTTP 200 + bounded Firebase probe returned data'
+        terminal_log(f"[BULK] RESULT {safe_url(url)} -> ACTIVE & WORKING | HTTP 200 | {latency_ms}ms")
+        cb_record_success(host)
+        _domain_stats_update(host, "active", latency_ms)
+        cache_set(ck, (result_status, result_code, result_error, latency_ms))
+        return result_status, result_code, result_error
+
+    except (TimeoutError, ConnectionError, OSError) as exc:
+        result_status = 'unreachable'
+        result_error = f'{type(exc).__name__}: {exc}'
+        terminal_log(f"[BULK] RESULT {safe_url(url)} -> UNREACHABLE | {result_error}")
+        cb_record_fail(host)
+        _domain_stats_update(host, "unreachable", latency_ms)
+        cache_set(ck, (result_status, result_code, result_error, latency_ms))
+        return result_status, result_code, result_error
+    except Exception as exc:
+        result_status = 'unreachable'
+        result_error = f'{type(exc).__name__}: {exc}'
+        terminal_log(f"[BULK] RESULT {safe_url(url)} -> UNREACHABLE | {result_error}")
+        cb_record_fail(host)
+        _domain_stats_update(host, "unreachable", latency_ms)
+        cache_set(ck, (result_status, result_code, result_error, latency_ms))
+        return result_status, result_code, result_error
+    finally:
+        if conn:
+            try: conn.close()
+            except Exception: pass
+# ═══════════════════════════════════════════════════════════════════
+# BULK WORKERS (parallel + retry + circuit-breaker aware)
+# ═══════════════════════════════════════════════════════════════════
+
+def recover_bulk_jobs():
+    """Reset stuck jobs on startup + wipe leftover secrets + retry failed items."""
+    try:
+        con = get_db()
+        # Reset stuck processing jobs
+        con.execute("UPDATE bulk_jobs SET status='pending', started_at=NULL WHERE status='processing'")
+        # Wipe pending secrets (they were never used)
+        con.execute("UPDATE bulk_job_items SET secret=NULL WHERE status='pending'")
+        # Retry unreachable items if under retry limit
+        con.execute("""
+          UPDATE bulk_job_items
+          SET status='pending', retry_count = retry_count + 1
+          WHERE status='unreachable' AND retry_count < ?
+        """, (BULK_RETRY_MAX,))
+        con.commit()
+        con.close()
+        log("bulk jobs recovered", level="INFO", tag="BULK")
+    except Exception as exc:
+        log_bulk(f"[BULK] recover failed: {type(exc).__name__}")
+
+def _db_retry(fn, attempts=5, delay=0.2):
+    """Run fn(con) with DB retry on busy. Returns fn's result or None."""
+    for i in range(attempts):
+        try:
+            con = get_db()
+            try:
+                result = fn(con)
+                con.commit()
+                return result
+            finally:
+                con.close()
+        except sqlite3.OperationalError:
+            time.sleep(delay * (i + 1))
+        except Exception as exc:
+            log(f"db_retry unexpected: {type(exc).__name__}", level="WARN")
+            return None
+    return None
+
+def _tg_running():
+    if _tg is None: return True
+    try: return _tg.STATE.running
+    except Exception: return True
+
+def _should_stop():
+    return _STATS.get("shutdown_requested") or not _tg_running()
+
+def _next_pending_item(job_id: int):
+    """Fetch next pending item for a job (with DB retry)."""
+    return _db_retry(lambda c: (
+        c.execute("SELECT status FROM bulk_jobs WHERE id=?", (job_id,)).fetchone(),
+        c.execute("""
+          SELECT * FROM bulk_job_items
+          WHERE job_id=? AND status='pending'
+          ORDER BY retry_count ASC, id ASC
+          LIMIT 1
+        """, (job_id,)).fetchone()
+    ))
+
+def _mark_item_result(item_id: int, job_id: int, status: str,
+                       http_status, error, latency_ms: int):
+    """Update item + job counters atomically."""
+    def _do(c):
+        c.execute("""
+          UPDATE bulk_job_items
+          SET status=?, http_status=?, error=?, secret=NULL,
+              latency_ms=?, checked_at=CURRENT_TIMESTAMP
+          WHERE id=?
+        """, (status, http_status, error, latency_ms, item_id))
+        col = {
+            "active": "active",
+            "invalid_no_data": "no_data",
+            "inactive": "inactive",
+        }.get(status, "unreachable")
+        c.execute(
+            f"UPDATE bulk_jobs SET processed=processed+1, {col}={col}+1 WHERE id=?",
+            (job_id,)
+        )
+    _db_retry(_do)
+
+def _complete_job(job_id: int):
+    _db_retry(lambda c: c.execute(
+        "UPDATE bulk_jobs SET status='completed', completed_at=CURRENT_TIMESTAMP WHERE id=?",
+        (job_id,)
+    ))
+
+def _cancel_job(job_id: int):
+    _db_retry(lambda c: (
+        c.execute(
+            "UPDATE bulk_job_items SET status='cancelled', secret=NULL "
+            "WHERE job_id=? AND status='pending'", (job_id,)),
+        c.execute(
+            "UPDATE bulk_jobs SET status='cancelled', "
+            "completed_at=COALESCE(completed_at,CURRENT_TIMESTAMP) WHERE id=?",
+            (job_id,))
+    ))
+
+def process_bulk_job(job_id: int):
+    """Process a single bulk job until done."""
+    log_bulk(f"[BULK] JOB #{job_id} STARTED")
+    while True:
+        if _should_stop():
+            log_bulk(f"[BULK] JOB #{job_id} interrupted (shutdown)")
+            return
+
+        row = _next_pending_item(job_id)
+        if row is None:
+            time.sleep(0.5); continue
+        job, item = row
+
+        if not job:
+            return
+        if job["status"] == "cancelled":
+            _cancel_job(job_id)
+            log_bulk(f"[BULK] JOB #{job_id} CANCELLED")
+            return
+        if not item:
+            _complete_job(job_id)
+            log_bulk(f"[BULK] JOB #{job_id} COMPLETED")
+            return
+
+        # ── Probe ──
+        item_secret = item["secret"] if "secret" in item.keys() else None
+        probe_start = time.time()
+        status, http_status, error = check_firebase_reachability(
+            item["url"], secret=item_secret
+        )
+        latency_ms = int((time.time() - probe_start) * 1000)
+
+        # ── Save result ──
+        _mark_item_result(item["id"], job_id, status, http_status, error, latency_ms)
+
+        # ── Stats ──
+        with _STATS_LOCK:
+            _STATS["bulk_items_checked"] = _STATS.get("bulk_items_checked", 0) + 1
+            if status == "active":
+                _STATS["bulk_items_active"] = _STATS.get("bulk_items_active", 0) + 1
+
+        # ── Notify Telegram (fire-and-forget) ──
+        if status == "active":
+            _bump("notify_calls")
+            _tg_notify_active(
+                url=item["url"],
+                job_id=job_id,
+                source="public-bulk",
+                meta={"code": http_status, "reason": error, "latency_ms": latency_ms},
+            )
+            _bump("notify_success")
+
+def bulk_worker_loop(worker_id: int):
+    """Single worker loop — pulls jobs atomically."""
+    log(f"worker #{worker_id} started", level="INFO", tag="BULK")
+    while not _STATS.get("shutdown_requested"):
+        if not _tg_running():
+            time.sleep(1.0)
+            continue
+
+        job_id = None
+        try:
+            con = get_db()
+            con.execute("BEGIN IMMEDIATE")
+            # Priority-aware selection: high priority first, then FIFO
+            row = con.execute("""
+              SELECT id FROM bulk_jobs
+              WHERE status='pending'
+              ORDER BY priority DESC, id ASC
+              LIMIT 1
+            """).fetchone()
+            if row:
+                cur = con.execute("""
+                  UPDATE bulk_jobs
+                  SET status='processing',
+                      started_at=CURRENT_TIMESTAMP,
+                      error=NULL
+                  WHERE id=? AND status='pending'
+                """, (row["id"],))
+                if cur.rowcount == 1:
+                    job_id = row["id"]
+                con.commit()
+            else:
+                con.rollback()
+            con.close()
+        except sqlite3.OperationalError:
+            time.sleep(0.5); continue
+        except Exception as exc:
+            log(f"worker #{worker_id} err: {type(exc).__name__}", level="WARN", tag="BULK")
+            time.sleep(1.0); continue
+
+        if job_id:
+            try:
+                process_bulk_job(job_id)
+            except Exception as exc:
+                log_bulk(f"[BULK] job #{job_id} crashed: {type(exc).__name__}: {exc}")
+                try:
+                    con = get_db()
+                    con.execute(
+                        "UPDATE bulk_jobs SET status='failed', error=? WHERE id=?",
+                        (str(exc)[:500], job_id)
+                    )
+                    con.commit(); con.close()
+                except Exception: pass
+        else:
+            time.sleep(1.0)
+
+def start_bulk_workers():
+    """Start N parallel workers + load circuit breaker state."""
+    recover_bulk_jobs()
+    _cb_load_from_db()
+    for i in range(BULK_WORKERS):
+        t = threading.Thread(target=bulk_worker_loop, args=(i,),
+                             name=f"bulk-worker-{i}", daemon=True)
+        t.start()
+    log_bulk(f"[BULK] Started {BULK_WORKERS} parallel workers")
+
+# ═══════════════════════════════════════════════════════════════════
+# SESSIONS + RATE LIMIT
+# ═══════════════════════════════════════════════════════════════════
+
+SESSIONS: dict = {}       # token -> expiry timestamp
+RATE: dict = {}           # ip -> [timestamps]
+
+def cleanup():
+    now = time.time()
+    for token, expires in list(SESSIONS.items()):
+        if expires <= now:
+            SESSIONS.pop(token, None)
+    for ip, entries in list(RATE.items()):
+        entries = [t for t in entries if now - t < 300]
+        if entries:
+            RATE[ip] = entries
+        else:
+            RATE.pop(ip, None)
+
+def _rate_limit(ip: str, limit: int = 5, window: int = 300) -> bool:
+    """Return True if allowed, False if rate limited."""
+    now = time.time()
+    entries = [t for t in RATE.get(ip, []) if now - t < window]
+    if len(entries) >= limit:
+        return False
+    entries.append(now)
+    RATE[ip] = entries
+    return True
+
+# ═══════════════════════════════════════════════════════════════════
+# API TRACING
+# ═══════════════════════════════════════════════════════════════════
+
+def _trace_url(raw):
+    try:
+        u = urlparse(str(raw or ""))
+        host = (u.hostname or "").lower()
+        if not host:
+            return str(raw or "<unknown>").split("?", 1)[0]
+        port = f":{u.port}" if u.port and u.port not in (80, 443) else ""
+        path = u.path or "/"
+        return f"{u.scheme.lower()}://{host}{port}{path}"
+    except Exception:
+        return "<invalid-url>"
+
+def api_trace(method, url, status=None, duration_ms=None, source="server", note=""):
+    if not API_TRACE_ENABLED: return
+    bits = [f"[API] {method.upper():6s}", _trace_url(url)]
+    if status is not None: bits.append(f"-> {status}")
+    if duration_ms is not None: bits.append(f"{duration_ms:.0f}ms")
+    if source != "server": bits.append(f"[{source}]")
+    if note: bits.append(str(note)[:160])
+    print(" ".join(bits), flush=True)
+
+def _client_log_body(handler):
+    body, err = read_json(handler, 8_000)
+    if err or not isinstance(body, dict):
+        return None, err or "Invalid telemetry payload."
+    method = str(body.get("method", "GET"))[:12].upper()
+    target = str(body.get("url", ""))[:1000]
+    try: status = int(body.get("status")) if body.get("status") is not None else None
+    except Exception: status = None
+    try: duration = float(body.get("duration_ms")) if body.get("duration_ms") is not None else None
+    except Exception: duration = None
+    source = str(body.get("source", "browser"))[:32]
+    return {"method": method, "url": target, "status": status,
+            "duration_ms": duration, "source": source}, None
+
+# ═══════════════════════════════════════════════════════════════════
+# HTTP RESPONSE HELPERS
+# ═══════════════════════════════════════════════════════════════════
+
+def json_out(handler, payload, code=200, extra=None):
+    data = json.dumps(payload, ensure_ascii=False).encode()
+    handler.send_response(code)
+    handler.send_header("Content-Type", "application/json; charset=utf-8")
+    handler.send_header("Content-Length", str(len(data)))
+    if extra:
+        for k, v in extra.items():
+            handler.send_header(k, v)
+    handler.end_headers()
+    handler.wfile.write(data)
+    _bump_status(code)
+    _bump("requests_total")
+
+def token_from_cookie(headers):
+    for part in headers.get("Cookie", "").split(";"):
+        part = part.strip()
+        if part.startswith("admin_session="):
+            return part.split("=", 1)[1]
+    return None
+
+def is_admin(headers):
+    cleanup()
+    token = token_from_cookie(headers)
+    return bool(token and token in SESSIONS and SESSIONS[token] > time.time())
+
+def require_admin(handler):
+    if not is_admin(handler.headers):
+        json_out(handler, {"ok": False, "error": "Admin authentication required."}, 401)
+        return False
+    return True
+
+# ═══════════════════════════════════════════════════════════════════
+# INPUT HELPERS
+# ═══════════════════════════════════════════════════════════════════
+
+def safe_filename(value):
+    name = Path(value or "app.apk").name
+    name = "".join(c for c in name if c.isalnum() or c in "._- ")
+    return (name.strip() or "app.apk")[:180]
+
+def read_json(handler, max_bytes=100_000):
+    try:
+        length = int(handler.headers.get("Content-Length", "0"))
+    except ValueError:
+        return None, "Invalid Content-Length."
+    if length > max_bytes:
+        return None, "Request too large."
+    try:
+        return json.loads(handler.rfile.read(length) or b"{}"), None
+    except Exception:
+        return None, "Invalid JSON."
+
+def field(obj, name, limit):
+    return str(obj.get(name, "") or "").strip()[:limit]
+# ═══════════════════════════════════════════════════════════════════
+# HTTP HANDLER
+# ═══════════════════════════════════════════════════════════════════
+
+class Handler(SimpleHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    server_version = "BerlinXPanel/7.0"
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, directory=str(ROOT), **kwargs)
+
+    def log_message(self, fmt, *args):
+        try:
+            request_line = args[0] if args else ""
+            status = args[1] if len(args) > 1 else "-"
+            size = args[2] if len(args) > 2 else "-"
+            method = request_line.split(" ", 1)[0] if request_line else "?"
+            target = request_line.split(" ", 2)[1] if len(request_line.split(" ", 2)) > 1 else "?"
+            if target == "/api/client-request-log":
+                return
+            if target.startswith("/api/"):
+                api_trace(method, target, status, source="server")
+            else:
+                print(f"[WEB] {method} {target} -> {status} ({size})", flush=True)
+        except Exception:
+            pass
+
+    def end_headers(self):
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "same-origin")
+        self.send_header("X-Frame-Options", "SAMEORIGIN")
+        super().end_headers()
+
+    # ═══════════════════════════════════════════════════════════════
+    # GET ROUTES
+    # ═══════════════════════════════════════════════════════════════
+
+    def do_GET(self):
+        path = urlparse(self.path).path
+        query = parse_qs(urlparse(self.path).query)
+
+        # ── Basic ──
+        if path == "/health":
+            return json_out(self, {
+                "ok": True,
+                "service": "berlin-x-panel",
+                "uptime_sec": int(time.time() - _START_TIME),
+                "version": self.server_version,
+            })
+
+        if path == "/api/health/detailed":
+            return self._health_detailed()
+
+        if path == "/api/metrics":
+            return json_out(self, {"ok": True, "metrics": _snapshot_stats()})
+
+        if path == "/api/circuit-breaker":
+            if not require_admin(self): return
+            return json_out(self, {
+                "ok": True,
+                "threshold": CB_FAIL_THRESHOLD,
+                "cooldown_sec": CB_COOLDOWN_SEC,
+                "state": cb_snapshot(),
+            })
+
+        if path == "/api/cache":
+            if not require_admin(self): return
+            return json_out(self, {"ok": True, "cache": cache_snapshot()})
+
+        # ── Pretty routes ──
+        if path == "/admin":
+            self.path = "/admin.html"
+            return super().do_GET()
+        if path == "/bulk":
+            self.path = "/bulk.html"
+            return super().do_GET()
+
+        # ── Client telemetry (GET variant) ──
+        if path == "/api/client-request-log":
+            if not self.headers.get("Content-Type", "").startswith("application/json"):
+                return json_out(self, {"ok": False, "error": "Use application/json."}, 400)
+            data, err = _client_log_body(self)
+            if err:
+                return json_out(self, {"ok": False, "error": err}, 400)
+            api_trace(data["method"], data["url"], data["status"],
+                      data["duration_ms"], data["source"], "client request")
+            return json_out(self, {"ok": True}, 200)
+
+        # ── Public bulk jobs list ──
+        if path == "/api/public-bulk/jobs":
+            limit = min(200, max(1, int(query.get("limit", ["50"])[0])))
+            status_filter = (query.get("status", [""])[0] or "").strip().lower()
+            con = get_db()
+            if status_filter:
+                rows = con.execute("""
+                  SELECT id,filename,total,processed,active,inactive,no_data,
+                         unreachable,status,priority,retry_count,
+                         created_at,started_at,completed_at,error
+                  FROM bulk_jobs WHERE status=? ORDER BY id DESC LIMIT ?
+                """, (status_filter, limit)).fetchall()
+            else:
+                rows = con.execute("""
+                  SELECT id,filename,total,processed,active,inactive,no_data,
+                         unreachable,status,priority,retry_count,
+                         created_at,started_at,completed_at,error
+                  FROM bulk_jobs ORDER BY id DESC LIMIT ?
+                """, (limit,)).fetchall()
+            con.close()
+            return json_out(self, {"ok": True, "jobs": [dict(r) for r in rows]})
+
+        # ── Public bulk job detail (by token) ──
+        if path.startswith("/api/public-bulk/jobs/"):
+            token = path.rsplit("/", 1)[1]
+            if not token or len(token) > 100:
+                return json_out(self, {"ok": False, "error": "Invalid job token."}, 400)
+            inc_items = query.get("items", ["1"])[0] not in ("0", "false", "no")
+            con = get_db()
+            job = con.execute("SELECT * FROM bulk_jobs WHERE public_token=?", (token,)).fetchone()
+            items = []
+            if job and inc_items:
+                items = con.execute("""
+                  SELECT id,url,status,http_status,error,retry_count,
+                         latency_ms,checked_at
+                  FROM bulk_job_items WHERE job_id=? ORDER BY id
+                """, (job["id"],)).fetchall()
+            con.close()
+            if not job:
+                return json_out(self, {"ok": False, "error": "Job not found."}, 404)
+            out = {"ok": True,
+                   "job": {k: job[k] for k in job.keys() if k != 'public_token'}}
+            if inc_items:
+                out["items"] = [dict(r) for r in items]
+            return json_out(self, out)
+
+        # ── Admin: bulk jobs list ──
+        if path == "/api/bulk-firebase/jobs":
+            if not require_admin(self): return
+            limit = min(500, max(1, int(query.get("limit", ["100"])[0])))
+            con = get_db()
+            rows = con.execute("""
+              SELECT id,filename,total,processed,active,inactive,no_data,
+                     unreachable,status,priority,retry_count,
+                     created_at,started_at,completed_at,error
+              FROM bulk_jobs ORDER BY id DESC LIMIT ?
+            """, (limit,)).fetchall()
+            con.close()
+            return json_out(self, {"ok": True, "jobs": [dict(r) for r in rows]})
+
+        # ── Admin: bulk job detail ──
+        if path.startswith("/api/bulk-firebase/jobs/"):
+            if not require_admin(self): return
+            tail = path.rsplit("/", 1)[1]
+            try: job_id = int(tail)
+            except ValueError:
+                return json_out(self, {"ok": False, "error": "Invalid job id."}, 400)
+            con = get_db()
+            job = con.execute("SELECT * FROM bulk_jobs WHERE id=?", (job_id,)).fetchone()
+            items = con.execute("""
+              SELECT id,url,status,http_status,error,retry_count,
+                     latency_ms,checked_at
+              FROM bulk_job_items WHERE job_id=? ORDER BY id
+            """, (job_id,)).fetchall() if job else []
+            con.close()
+            if not job:
+                return json_out(self, {"ok": False, "error": "Job not found."}, 404)
+            return json_out(self, {"ok": True, "job": dict(job),
+                                    "items": [dict(r) for r in items]})
+
+        # ── Admin: domain stats ──
+        if path == "/api/domain-stats":
+            if not require_admin(self): return
+            limit = min(500, max(1, int(query.get("limit", ["100"])[0])))
+            con = get_db()
+            rows = con.execute("""
+              SELECT * FROM domain_stats
+              ORDER BY total_checks DESC, last_check_at DESC
+              LIMIT ?
+            """, (limit,)).fetchall()
+            con.close()
+            return json_out(self, {"ok": True, "domains": [dict(r) for r in rows]})
+
+        # ── Admin: apps list ──
+        if path == "/api/apps":
+            if not require_admin(self): return
+            q = (query.get("q", [""])[0] or "").strip()
+            con = get_db()
+            if q:
+                like = f"%{q}%"
+                rows = con.execute("""
+                  SELECT * FROM apps
+                  WHERE app_name LIKE ? OR owner_name LIKE ?
+                     OR owner_email LIKE ? OR firebase_project_id LIKE ?
+                  ORDER BY id DESC
+                """, (like, like, like, like)).fetchall()
+            else:
+                rows = con.execute("SELECT * FROM apps ORDER BY id DESC").fetchall()
+            con.close()
+            return json_out(self, {"ok": True, "apps": [dict(r) for r in rows]})
+
+        # ── Admin: panel connections ──
+        if path == "/api/panel-connections":
+            if not require_admin(self): return
+            con = get_db()
+            rows = con.execute("SELECT * FROM connections ORDER BY id DESC LIMIT 500").fetchall()
+            con.close()
+            return json_out(self, {"ok": True, "connections": [dict(r) for r in rows]})
+
+        # ── Admin: dashboard stats (extended) ──
+        if path == "/api/admin/stats":
+            if not require_admin(self): return
+            con = get_db()
+            total = con.execute("SELECT COUNT(*) FROM apps").fetchone()[0]
+            with_apk = con.execute("SELECT COUNT(*) FROM apps WHERE apk_stored_name IS NOT NULL").fetchone()[0]
+            total_bytes = con.execute("SELECT COALESCE(SUM(apk_size),0) FROM apps").fetchone()[0]
+            connections = con.execute("SELECT COUNT(*) FROM connections").fetchone()[0]
+            bulk_jobs = con.execute("SELECT COUNT(*) FROM bulk_jobs").fetchone()[0]
+            bulk_running = con.execute(
+                "SELECT COUNT(*) FROM bulk_jobs WHERE status IN ('pending','processing')"
+            ).fetchone()[0]
+            bulk_active_items = con.execute(
+                "SELECT COUNT(*) FROM bulk_job_items WHERE status='active'"
+            ).fetchone()[0]
+            domains_tracked = con.execute("SELECT COUNT(*) FROM domain_stats").fetchone()[0]
+            con.close()
+            return json_out(self, {
+                "ok": True,
+                "total": total,
+                "with_apk": with_apk,
+                "apk_bytes": total_bytes,
+                "connections": connections,
+                "bulk_jobs": bulk_jobs,
+                "bulk_running": bulk_running,
+                "bulk_active_items": bulk_active_items,
+                "domains_tracked": domains_tracked,
+                "max_apk_mb": MAX_APK_MB,
+                "bulk_workers": BULK_WORKERS,
+            })
+
+        # ── Admin: APK download ──
+        if path.startswith("/api/apk/"):
+            if not require_admin(self): return
+            try: app_id = int(path.rsplit("/", 1)[1])
+            except ValueError:
+                return json_out(self, {"ok": False, "error": "Invalid id."}, 400)
+            con = get_db()
+            row = con.execute("SELECT * FROM apps WHERE id=?", (app_id,)).fetchone()
+            con.close()
+            if not row or not row["apk_stored_name"]:
+                return json_out(self, {"ok": False, "error": "APK not found."}, 404)
+            f = APK_DIR / row["apk_stored_name"]
+            if not f.is_file():
+                return json_out(self, {"ok": False, "error": "APK file missing."}, 404)
+            self.send_response(200)
+            self.send_header("Content-Type", "application/vnd.android.package-archive")
+            self.send_header("Content-Length", str(f.stat().st_size))
+            self.send_header("Content-Disposition",
+                             f'attachment; filename="{safe_filename(row["apk_original_name"])}"')
+            self.end_headers()
+            with f.open("rb") as src:
+                while chunk := src.read(1024 * 1024):
+                    self.wfile.write(chunk)
+            _bump_status(200)
+            _bump("requests_total")
+            return
+
+        # ── Static files fallback ──
+        return super().do_GET()
+
+    # ═══════════════════════════════════════════════════════════════
+    # DETAILED HEALTH
+    # ═══════════════════════════════════════════════════════════════
+
+    def _health_detailed(self):
+        """Detailed health check with DB, worker, and dependency status."""
+        checks = {}
+        # DB check
+        try:
+            con = get_db()
+            con.execute("SELECT 1").fetchone()
+            con.close()
+            checks["database"] = {"ok": True}
+        except Exception as exc:
+            checks["database"] = {"ok": False, "error": type(exc).__name__}
+
+        # Worker check
+        try:
+            active_workers = sum(
+                1 for t in threading.enumerate()
+                if t.name.startswith("bulk-worker-")
+            )
+            checks["workers"] = {
+                "ok": active_workers > 0,
+                "active": active_workers,
+                "expected": BULK_WORKERS,
+            }
+        except Exception as exc:
+            checks["workers"] = {"ok": False, "error": type(exc).__name__}
+
+        # Telegram check
+        checks["telegram"] = {
+            "ok": _tg is not None,
+            "loaded": _tg is not None,
+        }
+
+        all_ok = all(v.get("ok") for v in checks.values())
+        return json_out(self, {
+            "ok": all_ok,
+            "service": "berlin-x-panel",
+            "version": self.server_version,
+            "uptime_sec": int(time.time() - _START_TIME),
+            "checks": checks,
+            "stats": _snapshot_stats(),
+        }, 200 if all_ok else 503)
+# ═══════════════════════════════════════════════════════════════
+# POST ROUTES
+# ═══════════════════════════════════════════════════════════════
+
+    def do_POST(self):
+        path = urlparse(self.path).path
+
+        # ── Admin login ──
+        if path == "/api/admin/login":
+            body, err = read_json(self, 16_384)
+            if err:
+                return json_out(self, {"ok": False, "error": err}, 400)
+            if not ADMIN_PASSWORD:
+                return json_out(self, {"ok": False, "error": "ADMIN_PASSWORD not configured."}, 503)
+            if (secrets.compare_digest(str(body.get("username", "")), ADMIN_USER)
+                    and secrets.compare_digest(str(body.get("password", "")), ADMIN_PASSWORD)):
+                token = secrets.token_urlsafe(36)
+                SESSIONS[token] = time.time() + SESSION_TTL
+                return json_out(self, {"ok": True}, 200, {
+                    "Set-Cookie": f"admin_session={token}; HttpOnly; SameSite=Strict; Path=/; Max-Age={SESSION_TTL}"
+                })
+            return json_out(self, {"ok": False, "error": "Invalid admin credentials."}, 401)
+
+        # ── Admin logout ──
+        if path == "/api/admin/logout":
+            token = token_from_cookie(self.headers)
+            if token:
+                SESSIONS.pop(token, None)
+            return json_out(self, {"ok": True}, 200, {
+                "Set-Cookie": "admin_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0"
+            })
+
+        # ── Client telemetry ──
+        if path == "/api/client-request-log":
+            if not self.headers.get("Content-Type", "").startswith("application/json"):
+                return json_out(self, {"ok": False, "error": "Use application/json."}, 400)
+            data, err = _client_log_body(self)
+            if err:
+                return json_out(self, {"ok": False, "error": err}, 400)
+            api_trace(data["method"], data["url"], data["status"],
+                      data["duration_ms"], data["source"], "client request")
+            return json_out(self, {"ok": True}, 200)
+
+        # ── Public bulk job creation ──
+        if path == "/api/public-bulk/jobs":
+            ip = self.client_address[0] if self.client_address else "unknown"
+            now = time.time()
+            recent = [t for t in PUBLIC_BULK_RATE.get(ip, []) if now - t < PUBLIC_BULK_WINDOW]
+            if len(recent) >= PUBLIC_BULK_LIMIT:
+                return json_out(self, {"ok": False, "error": "Bulk check rate limit reached."},
+                                429, {"Retry-After": str(PUBLIC_BULK_WINDOW)})
+            recent.append(now)
+            PUBLIC_BULK_RATE[ip] = recent
+
+            if not self.headers.get("Content-Type", "").startswith("application/json"):
+                return json_out(self, {"ok": False, "error": "Use application/json."}, 400)
+            body, err = read_json(self, BULK_MAX_BYTES + 20_000)
+            if err:
+                return json_out(self, {"ok": False, "error": err}, 400)
+            filename = field(body, "filename", 180) or "firebase-urls.txt"
+            content = str(body.get("content", "") or "")
+            if len(content.encode("utf-8")) > BULK_MAX_BYTES:
+                return json_out(self, {"ok": False, "error": f"TXT exceeds {BULK_MAX_BYTES // 1000} KB."}, 413)
+            pairs = normalize_bulk_urls(content)
+            if not pairs:
+                return json_out(self, {"ok": False, "error": "No valid Firebase HTTPS URLs found."}, 400)
+
+            con = get_db()
+            token = secrets.token_urlsafe(24)
+            cur = con.execute(
+                "INSERT INTO bulk_jobs(filename,total,status,public_token) VALUES(?,?, 'pending',?)",
+                (filename, len(pairs), token)
+            )
+            job_id = cur.lastrowid
+            con.executemany(
+                "INSERT INTO bulk_job_items(job_id,url,secret) VALUES(?,?,?)",
+                [(job_id, u, s) for u, s in pairs]
+            )
+            con.commit()
+            con.close()
+            _bump("bulk_jobs_created")
+            log(f"public bulk job #{job_id} created ({len(pairs)} urls)",
+                level="INFO", tag="BULK", source_ip=ip)
+            return json_out(self, {"ok": True, "job_id": job_id,
+                                    "token": token, "total": len(pairs)}, 201)
+
+        # ── Admin bulk job creation ──
+        if path == "/api/bulk-firebase/jobs":
+            if not require_admin(self): return
+            if not self.headers.get("Content-Type", "").startswith("application/json"):
+                return json_out(self, {"ok": False, "error": "Use application/json."}, 400)
+            body, err = read_json(self, BULK_MAX_BYTES + 20_000)
+            if err:
+                return json_out(self, {"ok": False, "error": err}, 400)
+            filename = field(body, "filename", 180) or "firebase-urls.txt"
+            priority = max(0, min(100, int(body.get("priority", 0))))
+            raw_urls = body.get("urls")
+            if isinstance(raw_urls, list):
+                if len(raw_urls) > BULK_MAX_URLS:
+                    raw_urls = raw_urls[:BULK_MAX_URLS]
+                joined = "\n".join(str(x) for x in raw_urls)
+                pairs = normalize_bulk_urls(joined)
+            else:
+                content = str(body.get("content", "") or "")
+                if len(content.encode("utf-8")) > BULK_MAX_BYTES:
+                    return json_out(self, {"ok": False, "error": f"TXT exceeds {BULK_MAX_BYTES // 1000} KB."}, 413)
+                pairs = normalize_bulk_urls(content)
+            if not pairs:
+                return json_out(self, {"ok": False, "error": "No valid Firebase HTTPS URLs found."}, 400)
+
+            con = get_db()
+            cur = con.execute(
+                "INSERT INTO bulk_jobs(filename,total,status,priority) VALUES(?,?, 'pending',?)",
+                (filename, len(pairs), priority)
+            )
+            job_id = cur.lastrowid
+            con.executemany(
+                "INSERT INTO bulk_job_items(job_id,url,secret) VALUES(?,?,?)",
+                [(job_id, u, s) for u, s in pairs]
+            )
+            con.commit()
+            con.close()
+            _bump("bulk_jobs_created")
+            log(f"admin bulk job #{job_id} created ({len(pairs)} urls, priority={priority})",
+                level="INFO", tag="BULK")
+            return json_out(self, {"ok": True, "job_id": job_id,
+                                    "total": len(pairs), "priority": priority}, 201)
+
+        # ── Admin bulk job cancel ──
+        if path.startswith("/api/bulk-firebase/jobs/") and path.endswith("/cancel"):
+            if not require_admin(self): return
+            try: job_id = int(path.split("/")[-2])
+            except ValueError:
+                return json_out(self, {"ok": False, "error": "Invalid job id."}, 400)
+            con = get_db()
+            row = con.execute("SELECT status FROM bulk_jobs WHERE id=?", (job_id,)).fetchone()
+            if not row:
+                con.close()
+                return json_out(self, {"ok": False, "error": "Job not found."}, 404)
+            if row["status"] in ("completed", "failed", "cancelled"):
+                con.close()
+                return json_out(self, {"ok": True, "status": row["status"]})
+            con.execute(
+                "UPDATE bulk_jobs SET status='cancelled', "
+                "completed_at=COALESCE(completed_at,CURRENT_TIMESTAMP) WHERE id=?",
+                (job_id,)
+            )
+            con.execute("UPDATE bulk_job_items SET secret=NULL WHERE job_id=? AND status='pending'",
+                        (job_id,))
+            con.commit()
+            con.close()
+            log(f"admin bulk job #{job_id} cancelled", level="INFO", tag="BULK")
+            return json_out(self, {"ok": True, "status": "cancelled"})
+
+        # ── Admin bulk job retry ──
+        if path.startswith("/api/bulk-firebase/jobs/") and path.endswith("/retry"):
+            if not require_admin(self): return
+            try: job_id = int(path.split("/")[-2])
+            except ValueError:
+                return json_out(self, {"ok": False, "error": "Invalid job id."}, 400)
+            def _do(c):
+                c.execute("UPDATE bulk_jobs SET status='pending', retry_count=retry_count+1, "
+                          "started_at=NULL, completed_at=NULL, error=NULL "
+                          "WHERE id=?", (job_id,))
+                c.execute("UPDATE bulk_job_items SET status='pending', retry_count=0 "
+                          "WHERE job_id=? AND status IN ('unreachable','inactive')",
+                          (job_id,))
+            res = _db_retry(_do)
+            if res is None:
+                return json_out(self, {"ok": False, "error": "DB error"}, 500)
+            log(f"admin bulk job #{job_id} requeued for retry", level="INFO", tag="BULK")
+            return json_out(self, {"ok": True, "status": "pending"})
+
+        # ── Panel connection log ──
+        if path == "/api/panel-connection":
+            if not self.headers.get("Content-Type", "").startswith("application/json"):
+                return json_out(self, {"ok": False, "error": "Use application/json."}, 400)
+            body, err = read_json(self, 16_384)
+            if err:
+                return json_out(self, {"ok": False, "error": err}, 400)
+            url = field(body, "firebase_database_url", 500)
+            if not url:
+                return json_out(self, {"ok": False, "error": "Firebase URL is required."}, 400)
+            if not (url.startswith("http://") or url.startswith("https://")):
+                return json_out(self, {"ok": False, "error": "Invalid Firebase URL."}, 400)
+            login_type = field(body, "login_type", 120) or "Firebase connection"
+            key_present = 1 if body.get("key_present") else 0
+            fingerprint = field(body, "key_fingerprint", 128)
+            con = get_db()
+            cur = con.execute("""
+              INSERT INTO connections(firebase_database_url,key_present,key_fingerprint,login_type)
+              VALUES(?,?,?,?)
+            """, (url, key_present, fingerprint, login_type))
+            con.commit()
+            con.close()
+            return json_out(self, {"ok": True, "id": cur.lastrowid}, 201)
+
+        # ── Public app registration ──
+        if path == "/api/apps":
+            ip = self.client_address[0]
+            if not _rate_limit(ip, limit=5, window=300):
+                return json_out(self, {"ok": False, "error": "Too many submissions."}, 429)
+
+            if not self.headers.get("Content-Type", "").startswith("application/json"):
+                return json_out(self, {"ok": False, "error": "Use application/json."}, 400)
+            body, err = read_json(self, 100_000)
+            if err:
+                return json_out(self, {"ok": False, "error": err}, 400)
+
+            app_name = field(body, "app_name", 120)
+            owner_name = field(body, "owner_name", 120)
+            owner_email = field(body, "owner_email", 180)
+            if not app_name or not owner_name or not owner_email:
+                return json_out(self, {"ok": False, "error": "App name, owner name and email required."}, 400)
+
+            con = get_db()
+            cur = con.execute("""
+              INSERT INTO apps (
+                app_name, owner_name, owner_email, firebase_project_id,
+                firebase_database_url, firebase_auth_domain, firebase_storage_bucket,
+                firebase_messaging_sender_id, firebase_app_id, firebase_config_json
+              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                app_name, owner_name, owner_email,
+                field(body, "firebase_project_id", 180),
+                field(body, "firebase_database_url", 500),
+                field(body, "firebase_auth_domain", 300),
+                field(body, "firebase_storage_bucket", 300),
+                field(body, "firebase_messaging_sender_id", 120),
+                field(body, "firebase_app_id", 240),
+                field(body, "firebase_config_json", 10000)
+            ))
+            con.commit()
+            app_id = cur.lastrowid
+            con.close()
+            return json_out(self, {"ok": True, "id": app_id}, 201)
+
+        # ── Not found ──
+        return json_out(self, {"ok": False, "error": "Not found."}, 404)
+
+    # ═══════════════════════════════════════════════════════════════
+    # PUT ROUTES (APK upload)
+    # ═══════════════════════════════════════════════════════════════
+
+    def do_PUT(self):
+        path = urlparse(self.path).path
+        if not (path.startswith("/api/apps/") and path.endswith("/apk")):
+            return json_out(self, {"ok": False, "error": "Not found."}, 404)
+
+        try: app_id = int(path.split("/")[3])
+        except Exception:
+            return json_out(self, {"ok": False, "error": "Invalid app id."}, 400)
+
+        try: length = int(self.headers.get("Content-Length", "0"))
+        except ValueError: length = 0
+        if length <= 0:
+            return json_out(self, {"ok": False, "error": "Empty APK."}, 400)
+        if length > MAX_APK_BYTES:
+            return json_out(self, {"ok": False, "error": f"APK exceeds {MAX_APK_MB} MB."}, 413)
+
+        original = safe_filename(self.headers.get("X-APK-Filename", "app.apk"))
+        if not original.lower().endswith(".apk"):
+            return json_out(self, {"ok": False, "error": "Only .apk files are accepted."}, 400)
+
+        con = get_db()
+        row = con.execute("SELECT apk_stored_name FROM apps WHERE id=?", (app_id,)).fetchone()
+        if not row:
+            con.close()
+            return json_out(self, {"ok": False, "error": "Registration not found."}, 404)
+
+        stored = f"{int(time.time())}-{secrets.token_hex(8)}.apk"
+        temp = APK_DIR / (".upload-" + secrets.token_hex(12))
+        digest = hashlib.sha256()
+        received = 0
+        try:
+            with temp.open("wb") as out:
+                while received < length:
+                    chunk = self.rfile.read(min(1024 * 1024, length - received))
+                    if not chunk:
+                        raise IOError("incomplete upload")
+                    received += len(chunk)
+                    digest.update(chunk)
+                    out.write(chunk)
+            temp.replace(APK_DIR / stored)
+            if row["apk_stored_name"]:
+                (APK_DIR / row["apk_stored_name"]).unlink(missing_ok=True)
+            con.execute("""
+              UPDATE apps SET apk_original_name=?, apk_stored_name=?, apk_size=?, apk_sha256=?
+              WHERE id=?
+            """, (original, stored, received, digest.hexdigest(), app_id))
+            con.commit()
+            con.close()
+            return json_out(self, {"ok": True, "id": app_id,
+                                    "sha256": digest.hexdigest(), "size": received})
+        except Exception:
+            temp.unlink(missing_ok=True)
+            con.close()
+            return json_out(self, {"ok": False, "error": "APK upload failed."}, 500)
+
+    # ═══════════════════════════════════════════════════════════════
+    # DELETE ROUTES (app delete)
+    # ═══════════════════════════════════════════════════════════════
+
+    def do_DELETE(self):
+        path = urlparse(self.path).path
+
+        # ── Delete app ──
+        if path.startswith("/api/apps/") and path.endswith("/delete"):
+            if not require_admin(self): return
+            try: app_id = int(path.split("/")[3])
+            except Exception:
+                return json_out(self, {"ok": False, "error": "Invalid id."}, 400)
+            con = get_db()
+            row = con.execute("SELECT apk_stored_name FROM apps WHERE id=?", (app_id,)).fetchone()
+            if not row:
+                con.close()
+                return json_out(self, {"ok": False, "error": "App not found."}, 404)
+            if row["apk_stored_name"]:
+                (APK_DIR / row["apk_stored_name"]).unlink(missing_ok=True)
+            con.execute("DELETE FROM apps WHERE id=?", (app_id,))
+            con.commit()
+            con.close()
+            return json_out(self, {"ok": True})
+
+        # ── Delete bulk job ──
+        if path.startswith("/api/bulk-firebase/jobs/"):
+            if not require_admin(self): return
+            try: job_id = int(path.rsplit("/", 1)[1])
+            except ValueError:
+                return json_out(self, {"ok": False, "error": "Invalid job id."}, 400)
+            def _do(c):
+                c.execute("DELETE FROM bulk_job_items WHERE job_id=?", (job_id,))
+                c.execute("DELETE FROM bulk_jobs WHERE id=?", (job_id,))
+            _db_retry(_do)
+            log(f"admin bulk job #{job_id} deleted", level="INFO", tag="BULK")
+            return json_out(self, {"ok": True})
+
+        # ── Clear all cached probes ──
+        if path == "/api/cache/clear":
+            if not require_admin(self): return
+            with _CACHE_LOCK:
+                n = len(_CACHE)
+                _CACHE.clear()
+            return json_out(self, {"ok": True, "cleared": n})
+
+        # ── Reset circuit breaker ──
+        if path == "/api/circuit-breaker/reset":
+            if not require_admin(self): return
+            with _CB_LOCK:
+                n = len(_CB_STATE)
+                _CB_STATE.clear()
+            def _do(c): c.execute("DELETE FROM circuit_breaker")
+            _db_retry(_do)
+            return json_out(self, {"ok": True, "cleared": n})
+
+        return json_out(self, {"ok": False, "error": "Not found."}, 404)
+    # ═══════════════════════════════════════════════════════════════
+    # POST ROUTES
+    # ═══════════════════════════════════════════════════════════════
+
+    def do_POST(self):
+        path = urlparse(self.path).path
+
+        # ── Admin login ──
+        if path == "/api/admin/login":
+            body, err = read_json(self, 16_384)
+            if err:
+                return json_out(self, {"ok": False, "error": err}, 400)
+            if not ADMIN_PASSWORD:
+                return json_out(self, {"ok": False, "error": "ADMIN_PASSWORD not configured."}, 503)
+            if (secrets.compare_digest(str(body.get("username", "")), ADMIN_USER)
+                    and secrets.compare_digest(str(body.get("password", "")), ADMIN_PASSWORD)):
+                token = secrets.token_urlsafe(36)
+                SESSIONS[token] = time.time() + SESSION_TTL
+                return json_out(self, {"ok": True}, 200, {
+                    "Set-Cookie": f"admin_session={token}; HttpOnly; SameSite=Strict; Path=/; Max-Age={SESSION_TTL}"
+                })
+            return json_out(self, {"ok": False, "error": "Invalid admin credentials."}, 401)
+
+        # ── Admin logout ──
+        if path == "/api/admin/logout":
+            token = token_from_cookie(self.headers)
+            if token:
+                SESSIONS.pop(token, None)
+            return json_out(self, {"ok": True}, 200, {
+                "Set-Cookie": "admin_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0"
+            })
+
+        # ── Client telemetry ──
+        if path == "/api/client-request-log":
+            if not self.headers.get("Content-Type", "").startswith("application/json"):
+                return json_out(self, {"ok": False, "error": "Use application/json."}, 400)
+            data, err = _client_log_body(self)
+            if err:
+                return json_out(self, {"ok": False, "error": err}, 400)
+            api_trace(data["method"], data["url"], data["status"],
+                      data["duration_ms"], data["source"], "client request")
+            return json_out(self, {"ok": True}, 200)
+
+        # ── Public bulk job creation ──
+        if path == "/api/public-bulk/jobs":
+            ip = self.client_address[0] if self.client_address else "unknown"
+            now = time.time()
+            recent = [t for t in PUBLIC_BULK_RATE.get(ip, []) if now - t < PUBLIC_BULK_WINDOW]
+            if len(recent) >= PUBLIC_BULK_LIMIT:
+                return json_out(self, {"ok": False, "error": "Bulk check rate limit reached."},
+                                429, {"Retry-After": str(PUBLIC_BULK_WINDOW)})
+            recent.append(now)
+            PUBLIC_BULK_RATE[ip] = recent
+
+            if not self.headers.get("Content-Type", "").startswith("application/json"):
+                return json_out(self, {"ok": False, "error": "Use application/json."}, 400)
+            body, err = read_json(self, BULK_MAX_BYTES + 20_000)
+            if err:
+                return json_out(self, {"ok": False, "error": err}, 400)
+            filename = field(body, "filename", 180) or "firebase-urls.txt"
+            content = str(body.get("content", "") or "")
+            if len(content.encode("utf-8")) > BULK_MAX_BYTES:
+                return json_out(self, {"ok": False, "error": f"TXT exceeds {BULK_MAX_BYTES // 1000} KB."}, 413)
+            pairs = normalize_bulk_urls(content)
+            if not pairs:
+                return json_out(self, {"ok": False, "error": "No valid Firebase HTTPS URLs found."}, 400)
+
+            con = get_db()
+            token = secrets.token_urlsafe(24)
+            cur = con.execute(
+                "INSERT INTO bulk_jobs(filename,total,status,public_token) VALUES(?,?, 'pending',?)",
+                (filename, len(pairs), token)
+            )
+            job_id = cur.lastrowid
+            con.executemany(
+                "INSERT INTO bulk_job_items(job_id,url,secret) VALUES(?,?,?)",
+                [(job_id, u, s) for u, s in pairs]
+            )
+            con.commit()
+            con.close()
+            _bump("bulk_jobs_created")
+            log(f"public bulk job #{job_id} created ({len(pairs)} urls)",
+                level="INFO", tag="BULK", source_ip=ip)
+            return json_out(self, {"ok": True, "job_id": job_id,
+                                    "token": token, "total": len(pairs)}, 201)
+
+        # ── Admin bulk job creation ──
+        if path == "/api/bulk-firebase/jobs":
+            if not require_admin(self): return
+            if not self.headers.get("Content-Type", "").startswith("application/json"):
+                return json_out(self, {"ok": False, "error": "Use application/json."}, 400)
+            body, err = read_json(self, BULK_MAX_BYTES + 20_000)
+            if err:
+                return json_out(self, {"ok": False, "error": err}, 400)
+            filename = field(body, "filename", 180) or "firebase-urls.txt"
+            priority = max(0, min(100, int(body.get("priority", 0))))
+            raw_urls = body.get("urls")
+            if isinstance(raw_urls, list):
+                if len(raw_urls) > BULK_MAX_URLS:
+                    raw_urls = raw_urls[:BULK_MAX_URLS]
+                joined = "\n".join(str(x) for x in raw_urls)
+                pairs = normalize_bulk_urls(joined)
+            else:
+                content = str(body.get("content", "") or "")
+                if len(content.encode("utf-8")) > BULK_MAX_BYTES:
+                    return json_out(self, {"ok": False, "error": f"TXT exceeds {BULK_MAX_BYTES // 1000} KB."}, 413)
+                pairs = normalize_bulk_urls(content)
+            if not pairs:
+                return json_out(self, {"ok": False, "error": "No valid Firebase HTTPS URLs found."}, 400)
+
+            con = get_db()
+            cur = con.execute(
+                "INSERT INTO bulk_jobs(filename,total,status,priority) VALUES(?,?, 'pending',?)",
+                (filename, len(pairs), priority)
+            )
+            job_id = cur.lastrowid
+            con.executemany(
+                "INSERT INTO bulk_job_items(job_id,url,secret) VALUES(?,?,?)",
+                [(job_id, u, s) for u, s in pairs]
+            )
+            con.commit()
+            con.close()
+            _bump("bulk_jobs_created")
+            log(f"admin bulk job #{job_id} created ({len(pairs)} urls, priority={priority})",
+                level="INFO", tag="BULK")
+            return json_out(self, {"ok": True, "job_id": job_id,
+                                    "total": len(pairs), "priority": priority}, 201)
+
+        # ── Admin bulk job cancel ──
+        if path.startswith("/api/bulk-firebase/jobs/") and path.endswith("/cancel"):
+            if not require_admin(self): return
+            try: job_id = int(path.split("/")[-2])
+            except ValueError:
+                return json_out(self, {"ok": False, "error": "Invalid job id."}, 400)
+            con = get_db()
+            row = con.execute("SELECT status FROM bulk_jobs WHERE id=?", (job_id,)).fetchone()
+            if not row:
+                con.close()
+                return json_out(self, {"ok": False, "error": "Job not found."}, 404)
+            if row["status"] in ("completed", "failed", "cancelled"):
+                con.close()
+                return json_out(self, {"ok": True, "status": row["status"]})
+            con.execute(
+                "UPDATE bulk_jobs SET status='cancelled', "
+                "completed_at=COALESCE(completed_at,CURRENT_TIMESTAMP) WHERE id=?",
+                (job_id,)
+            )
+            con.execute("UPDATE bulk_job_items SET secret=NULL WHERE job_id=? AND status='pending'",
+                        (job_id,))
+            con.commit()
+            con.close()
+            log(f"admin bulk job #{job_id} cancelled", level="INFO", tag="BULK")
+            return json_out(self, {"ok": True, "status": "cancelled"})
+
+        # ── Admin bulk job retry ──
+        if path.startswith("/api/bulk-firebase/jobs/") and path.endswith("/retry"):
+            if not require_admin(self): return
+            try: job_id = int(path.split("/")[-2])
+            except ValueError:
+                return json_out(self, {"ok": False, "error": "Invalid job id."}, 400)
+            def _do(c):
+                c.execute("UPDATE bulk_jobs SET status='pending', retry_count=retry_count+1, "
+                          "started_at=NULL, completed_at=NULL, error=NULL "
+                          "WHERE id=?", (job_id,))
+                c.execute("UPDATE bulk_job_items SET status='pending', retry_count=0 "
+                          "WHERE job_id=? AND status IN ('unreachable','inactive')",
+                          (job_id,))
+            res = _db_retry(_do)
+            if res is None:
+                return json_out(self, {"ok": False, "error": "DB error"}, 500)
+            log(f"admin bulk job #{job_id} requeued for retry", level="INFO", tag="BULK")
+            return json_out(self, {"ok": True, "status": "pending"})
+
+        # ── Panel connection log ──
+        if path == "/api/panel-connection":
+            if not self.headers.get("Content-Type", "").startswith("application/json"):
+                return json_out(self, {"ok": False, "error": "Use application/json."}, 400)
+            body, err = read_json(self, 16_384)
+            if err:
+                return json_out(self, {"ok": False, "error": err}, 400)
+            url = field(body, "firebase_database_url", 500)
+            if not url:
+                return json_out(self, {"ok": False, "error": "Firebase URL is required."}, 400)
+            if not (url.startswith("http://") or url.startswith("https://")):
+                return json_out(self, {"ok": False, "error": "Invalid Firebase URL."}, 400)
+            login_type = field(body, "login_type", 120) or "Firebase connection"
+            key_present = 1 if body.get("key_present") else 0
+            fingerprint = field(body, "key_fingerprint", 128)
+            con = get_db()
+            cur = con.execute("""
+              INSERT INTO connections(firebase_database_url,key_present,key_fingerprint,login_type)
+              VALUES(?,?,?,?)
+            """, (url, key_present, fingerprint, login_type))
+            con.commit()
+            con.close()
+            return json_out(self, {"ok": True, "id": cur.lastrowid}, 201)
+
+        # ── Public app registration ──
+        if path == "/api/apps":
+            ip = self.client_address[0]
+            if not _rate_limit(ip, limit=5, window=300):
+                return json_out(self, {"ok": False, "error": "Too many submissions."}, 429)
+
+            if not self.headers.get("Content-Type", "").startswith("application/json"):
+                return json_out(self, {"ok": False, "error": "Use application/json."}, 400)
+            body, err = read_json(self, 100_000)
+            if err:
+                return json_out(self, {"ok": False, "error": err}, 400)
+
+            app_name = field(body, "app_name", 120)
+            owner_name = field(body, "owner_name", 120)
+            owner_email = field(body, "owner_email", 180)
+            if not app_name or not owner_name or not owner_email:
+                return json_out(self, {"ok": False, "error": "App name, owner name and email required."}, 400)
+
+            con = get_db()
+            cur = con.execute("""
+              INSERT INTO apps (
+                app_name, owner_name, owner_email, firebase_project_id,
+                firebase_database_url, firebase_auth_domain, firebase_storage_bucket,
+                firebase_messaging_sender_id, firebase_app_id, firebase_config_json
+              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                app_name, owner_name, owner_email,
+                field(body, "firebase_project_id", 180),
+                field(body, "firebase_database_url", 500),
+                field(body, "firebase_auth_domain", 300),
+                field(body, "firebase_storage_bucket", 300),
+                field(body, "firebase_messaging_sender_id", 120),
+                field(body, "firebase_app_id", 240),
+                field(body, "firebase_config_json", 10000)
+            ))
+            con.commit()
+            app_id = cur.lastrowid
+            con.close()
+            return json_out(self, {"ok": True, "id": app_id}, 201)
+
+        # ── Not found ──
+        return json_out(self, {"ok": False, "error": "Not found."}, 404)
+
+    # ═══════════════════════════════════════════════════════════════
+    # PUT ROUTES (APK upload)
+    # ═══════════════════════════════════════════════════════════════
+
+    def do_PUT(self):
+        path = urlparse(self.path).path
+        if not (path.startswith("/api/apps/") and path.endswith("/apk")):
+            return json_out(self, {"ok": False, "error": "Not found."}, 404)
+
+        try: app_id = int(path.split("/")[3])
+        except Exception:
+            return json_out(self, {"ok": False, "error": "Invalid app id."}, 400)
+
+        try: length = int(self.headers.get("Content-Length", "0"))
+        except ValueError: length = 0
+        if length <= 0:
+            return json_out(self, {"ok": False, "error": "Empty APK."}, 400)
+        if length > MAX_APK_BYTES:
+            return json_out(self, {"ok": False, "error": f"APK exceeds {MAX_APK_MB} MB."}, 413)
+
+        original = safe_filename(self.headers.get("X-APK-Filename", "app.apk"))
+        if not original.lower().endswith(".apk"):
+            return json_out(self, {"ok": False, "error": "Only .apk files are accepted."}, 400)
+
+        con = get_db()
+        row = con.execute("SELECT apk_stored_name FROM apps WHERE id=?", (app_id,)).fetchone()
+        if not row:
+            con.close()
+            return json_out(self, {"ok": False, "error": "Registration not found."}, 404)
+
+        stored = f"{int(time.time())}-{secrets.token_hex(8)}.apk"
+        temp = APK_DIR / (".upload-" + secrets.token_hex(12))
+        digest = hashlib.sha256()
+        received = 0
+        try:
+            with temp.open("wb") as out:
+                while received < length:
+                    chunk = self.rfile.read(min(1024 * 1024, length - received))
+                    if not chunk:
+                        raise IOError("incomplete upload")
+                    received += len(chunk)
+                    digest.update(chunk)
+                    out.write(chunk)
+            temp.replace(APK_DIR / stored)
+            if row["apk_stored_name"]:
+                (APK_DIR / row["apk_stored_name"]).unlink(missing_ok=True)
+            con.execute("""
+              UPDATE apps SET apk_original_name=?, apk_stored_name=?, apk_size=?, apk_sha256=?
+              WHERE id=?
+            """, (original, stored, received, digest.hexdigest(), app_id))
+            con.commit()
+            con.close()
+            return json_out(self, {"ok": True, "id": app_id,
+                                    "sha256": digest.hexdigest(), "size": received})
+        except Exception:
+            temp.unlink(missing_ok=True)
+            con.close()
+            return json_out(self, {"ok": False, "error": "APK upload failed."}, 500)
+
+    # ═══════════════════════════════════════════════════════════════
+    # DELETE ROUTES (app delete)
+    # ═══════════════════════════════════════════════════════════════
+
+    def do_DELETE(self):
+        path = urlparse(self.path).path
+
+        # ── Delete app ──
+        if path.startswith("/api/apps/") and path.endswith("/delete"):
+            if not require_admin(self): return
+            try: app_id = int(path.split("/")[3])
+            except Exception:
+                return json_out(self, {"ok": False, "error": "Invalid id."}, 400)
+            con = get_db()
+            row = con.execute("SELECT apk_stored_name FROM apps WHERE id=?", (app_id,)).fetchone()
+            if not row:
+                con.close()
+                return json_out(self, {"ok": False, "error": "App not found."}, 404)
+            if row["apk_stored_name"]:
+                (APK_DIR / row["apk_stored_name"]).unlink(missing_ok=True)
+            con.execute("DELETE FROM apps WHERE id=?", (app_id,))
+            con.commit()
+            con.close()
+            return json_out(self, {"ok": True})
+
+        # ── Delete bulk job ──
+        if path.startswith("/api/bulk-firebase/jobs/"):
+            if not require_admin(self): return
+            try: job_id = int(path.rsplit("/", 1)[1])
+            except ValueError:
+                return json_out(self, {"ok": False, "error": "Invalid job id."}, 400)
+            def _do(c):
+                c.execute("DELETE FROM bulk_job_items WHERE job_id=?", (job_id,))
+                c.execute("DELETE FROM bulk_jobs WHERE id=?", (job_id,))
+            _db_retry(_do)
+            log(f"admin bulk job #{job_id} deleted", level="INFO", tag="BULK")
+            return json_out(self, {"ok": True})
+
+        # ── Clear all cached probes ──
+        if path == "/api/cache/clear":
+            if not require_admin(self): return
+            with _CACHE_LOCK:
+                n = len(_CACHE)
+                _CACHE.clear()
+            return json_out(self, {"ok": True, "cleared": n})
+
+        # ── Reset circuit breaker ──
+        if path == "/api/circuit-breaker/reset":
+            if not require_admin(self): return
+            with _CB_LOCK:
+                n = len(_CB_STATE)
+                _CB_STATE.clear()
+            def _do(c): c.execute("DELETE FROM circuit_breaker")
+            _db_retry(_do)
+            return json_out(self, {"ok": True, "cleared": n})
+
+        return json_out(self, {"ok": False, "error": "Not found."}, 404)
+
+# ═══════════════════════════════════════════════════════════════════
+# MAIN
+# ═══════════════════════════════════════════════════════════════════
+
+def main():
+    try:
+        signal.signal(signal.SIGINT,  _graceful_shutdown)
+        signal.signal(signal.SIGTERM, _graceful_shutdown)
+    except Exception: pass
+    log("=" * 60, level="INFO")
+    log("BERLIN X PANEL v7.0", level="INFO")
+    log(f"  workers : {BULK_WORKERS}", level="INFO")
+    log(f"  listen  : {HOST}:{PORT}", level="INFO")
+    log("=" * 60, level="INFO")
+    start_bulk_workers()
+    try:
+        import telegram_bot
+        telegram_bot.start()
+        log("telegram bot started", level="INFO")
+    except Exception as exc:
+        log(f"telegram startup skipped: {type(exc).__name__}", level="WARN")
+    try:
+        server = ThreadingHTTPServer((HOST, PORT), Handler)
+        server.daemon_threads = True
+        log(f"HTTP server listening on http://{HOST}:{PORT}", level="INFO")
+        log(f"  bulk   : http://127.0.0.1:{PORT}/bulk", level="INFO")
+        log(f"  admin  : http://127.0.0.1:{PORT}/admin", level="INFO")
+        log(f"  health : http://127.0.0.1:{PORT}/health", level="INFO")
+        server.serve_forever()
+    except KeyboardInterrupt:
+        _graceful_shutdown()
+    except Exception as exc:
+        log(f"HTTP server crashed: {type(exc).__name__}: {exc}", level="ERROR")
+        _graceful_shutdown()
+        sys.exit(1)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# MAIN (rebuilt)
+# ═══════════════════════════════════════════════════════════════════
+
+_shutdown_started = False
+_shutdown_lock = threading.Lock()
+
+def _graceful_shutdown(signum=None, frame=None):
+    global _shutdown_started
+    with _shutdown_lock:
+        if _shutdown_started: return
+        _shutdown_started = True
+    log(f"shutdown signal (signum={signum})", level="WARN")
+    _STATS["shutdown_requested"] = True
+    try:
+        if _tg is not None and hasattr(_tg, 'stop'):
+            _tg.stop()
+    except Exception: pass
+    log("shutdown complete", level="INFO")
+    sys.exit(0)
+
+def main():
+    try:
+        signal.signal(signal.SIGINT,  _graceful_shutdown)
+        signal.signal(signal.SIGTERM, _graceful_shutdown)
+    except Exception:
+        pass
+
+    log("=" * 60, level="INFO")
+    log("BERLIN X PANEL v7.0", level="INFO")
+    log(f"  workers : {BULK_WORKERS}", level="INFO")
+    log(f"  listen  : {HOST}:{PORT}", level="INFO")
+    log("=" * 60, level="INFO")
+
+    start_bulk_workers()
+
+    try:
+        import telegram_bot
+        telegram_bot.start()
+        log("telegram bot started", level="INFO")
+    except Exception as exc:
+        log(f"telegram startup skipped: {type(exc).__name__}: {exc}", level="WARN")
+
+    try:
+        server = ThreadingHTTPServer((HOST, PORT), Handler)
+        server.daemon_threads = True
+        log(f"HTTP server listening on http://{HOST}:{PORT}", level="INFO")
+        log(f"  bulk   : http://127.0.0.1:{PORT}/bulk", level="INFO")
+        log(f"  admin  : http://127.0.0.1:{PORT}/admin", level="INFO")
+        log(f"  health : http://127.0.0.1:{PORT}/health", level="INFO")
+        server.serve_forever()
+    except KeyboardInterrupt:
+        _graceful_shutdown()
+    except Exception as exc:
+        log(f"HTTP server crashed: {type(exc).__name__}: {exc}", level="ERROR")
+        _graceful_shutdown()
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

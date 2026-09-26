@@ -1,0 +1,45 @@
+{
+  "project": "BERLIN X PANEL",
+  "source": "testpa.html",
+  "source_bytes": 1022305,
+  "source_sha256": "e9ab0fbf6468f53d8e2f3f3923555b7510cc3e9c8d86ee9115c753a2f8dc649d",
+  "source_lines": 20329,
+  "split": {
+    "css/styles.css": {
+      "bytes": 195151,
+      "sha256": "8b603fa8a775f911b5be32b218e2c7919503e174e5b1c63aef9a1991b6f4964b",
+      "source": "exact inner content of original <style>"
+    },
+    "js/vendor.js": {
+      "bytes": 672373,
+      "sha256": "79ea1360264149cc698f6a364407a1d1d1719046f9d969520dd4d35ede6b5891",
+      "source": "exact contiguous section of original single <script>"
+    },
+    "js/firebase-service.js": {
+      "bytes": 30055,
+      "sha256": "9c0d70123d8b1de5396c4a0eb10860e7116477aff026709160f5473bc70bcf05",
+      "source": "exact contiguous section of original single <script>"
+    },
+    "js/connect-panel.js": {
+      "bytes": 96520,
+      "sha256": "1f0a34f8358a7bec0c278ec42e037b4ebd8730cc894ed9ba22738054ccb59005",
+      "source": "exact contiguous section of original single <script>"
+    },
+    "js/dashboard.js": {
+      "bytes": 25882,
+      "sha256": "fd1735a91f437ca9781f37b7532f92f0ff912a4158f125e85df278eea43f92c1",
+      "source": "exact contiguous section of original single <script>"
+    },
+    "js/app-bootstrap.js": {
+      "bytes": 952,
+      "sha256": "bab66e644acac851004423eb992642dcb719fbf7f8be015ddfed672d17321b59",
+      "source": "exact contiguous section of original single <script>"
+    }
+  },
+  "preservation": {
+    "js_concatenation_sha256": "060ec82c0dc499dc0e727f1f7ae40f32d0aca4bf61650a0f9454713e539ee4ce",
+    "original_script_inner_sha256": "060ec82c0dc499dc0e727f1f7ae40f32d0aca4bf61650a0f9454713e539ee4ce",
+    "css_inner_sha256": "8b603fa8a775f911b5be32b218e2c7919503e174e5b1c63aef9a1991b6f4964b",
+    "note": "No application code was rewritten, minified, or omitted. The JS is split only at existing top-level boundaries."
+  }
+}

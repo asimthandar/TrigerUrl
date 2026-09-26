@@ -1,0 +1,37 @@
+<!doctype html><html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>BERLIN X — App Registration</title>
+<style>
+:root{--bg:#07090d;--card:#111621;--line:#263044;--text:#f7f8fb;--muted:#94a0b3;--a:#ff4d7d;--b:#ff8b6a}
+*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 15% 0,#251126 0,transparent 40%),radial-gradient(circle at 100% 10%,#18233b 0,transparent 38%),var(--bg);color:var(--text);font-family:Inter,system-ui,sans-serif;min-height:100vh}.wrap{width:min(920px,100%);margin:auto;padding:28px 18px 70px}.top{display:flex;justify-content:space-between;align-items:center;margin-bottom:22px}.brand{font-weight:900;letter-spacing:.08em}.back{color:#fff;text-decoration:none;border:1px solid var(--line);padding:10px 14px;border-radius:12px}.card{background:#0f141eec;border:1px solid var(--line);border-radius:26px;padding:26px;box-shadow:0 30px 100px #0008;backdrop-filter:blur(18px)}h1{font-size:clamp(26px,5vw,42px);margin:0 0 8px}.lead{color:var(--muted);line-height:1.65}.grid{display:grid;grid-template-columns:1fr 1fr;gap:15px}.field{display:flex;flex-direction:column;gap:7px}.full{grid-column:1/-1}label{font-size:13px;color:#cbd3df}input,textarea{width:100%;background:#0a0e15;border:1px solid #293348;color:#fff;border-radius:13px;padding:13px 14px;outline:none}input:focus,textarea:focus{border-color:var(--a);box-shadow:0 0 0 3px #ff4d7d18}textarea{min-height:100px;resize:vertical}.drop{border:1px dashed #43506a;border-radius:16px;padding:18px;background:#0a0e15}.hint{font-size:12px;color:#7f8ba0;line-height:1.5}.actions{display:flex;align-items:center;gap:12px;margin-top:22px;flex-wrap:wrap}button{border:0;border-radius:13px;padding:13px 18px;font-weight:800;cursor:pointer;color:#fff;background:linear-gradient(135deg,var(--a),var(--b));box-shadow:0 10px 30px #ff4d7d25}button:disabled{opacity:.55}.status{padding:12px 14px;border-radius:12px;background:#101827;color:#aeb9ca;font-size:13px}.ok{color:#65e6b1}.err{color:#ff7c93}.notice{margin-top:18px;padding:14px;border:1px solid #5c4724;background:#1b160e;color:#d9c59d;border-radius:14px;font-size:12px;line-height:1.55}@media(max-width:680px){.grid{grid-template-columns:1fr}.full{grid-column:auto}}
+</style></head><body><div class="wrap">
+<div class="top"><div class="brand">BERLIN X PANEL</div><a class="back" href="/">← Main Panel</a></div>
+<section class="card"><h1>Register your app</h1><p class="lead">Submit an APK and the Firebase project configuration you want associated with it. The admin console stores and displays the submission.</p>
+<form id="form"><div class="grid">
+<div class="field"><label>App name *</label><input name="app_name" required maxlength="120" placeholder="My App"></div>
+<div class="field"><label>Owner name *</label><input name="owner_name" required maxlength="120" placeholder="Your name"></div>
+<div class="field"><label>Owner email *</label><input name="owner_email" type="email" required maxlength="180" placeholder="you@example.com"></div>
+<div class="field"><label>Firebase Project ID</label><input name="firebase_project_id" maxlength="180" placeholder="my-project-id"></div>
+<div class="field full"><label>Firebase Database URL</label><input name="firebase_database_url" maxlength="500" placeholder="https://..."></div>
+<div class="field"><label>Firebase Auth Domain</label><input name="firebase_auth_domain" maxlength="300"></div>
+<div class="field"><label>Firebase Storage Bucket</label><input name="firebase_storage_bucket" maxlength="300"></div>
+<div class="field"><label>Messaging Sender ID</label><input name="firebase_messaging_sender_id" maxlength="120"></div>
+<div class="field"><label>Firebase App ID</label><input name="firebase_app_id" maxlength="240"></div>
+<div class="field full"><label>Firebase Web Config JSON (optional)</label><textarea name="firebase_config_json" placeholder='{"projectId":"...","appId":"..."}'></textarea><div class="hint">Only public/client Firebase configuration. Never submit service-account JSON, private keys, passwords or access tokens.</div></div>
+<div class="field full"><label>APK file *</label><div class="drop"><input id="apk" type="file" accept=".apk,application/vnd.android.package-archive" required><div class="hint">APK only. Default server limit: 150 MB.</div></div></div>
+</div><div class="actions"><button id="submit">Upload & Register App</button><div id="status" class="status">Ready</div></div></form>
+<div class="notice">This portal records only what the user explicitly submits. It does not give the admin access to private Firebase databases, authentication accounts, tokens or other private user data.</div>
+</section></div>
+<script>
+const form=document.getElementById('form'),apk=document.getElementById('apk'),btn=document.getElementById('submit'),st=document.getElementById('status');
+const fields=()=>Object.fromEntries(new FormData(form).entries());
+form.addEventListener('submit',async e=>{e.preventDefault();btn.disabled=true;st.textContent='Registering app…';st.className='status';
+try{const file=apk.files[0];if(!file||!file.name.toLowerCase().endsWith('.apk'))throw Error('Please select an APK file.');
+const meta=fields();delete meta.apk;
+let r=await fetch('/api/apps',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(meta)});let j=await r.json();if(!r.ok||!j.ok)throw Error(j.error||'Registration failed');
+st.textContent='Uploading APK…';
+r=await fetch('/api/apps/'+j.id+'/apk',{method:'PUT',headers:{'Content-Type':'application/vnd.android.package-archive','Content-Length':String(file.size),'X-APK-Filename':file.name},body:file});
+j=await r.json();if(!r.ok||!j.ok)throw Error(j.error||'APK upload failed');
+st.textContent='✓ App registered. ID: '+j.id;st.className='status ok';form.reset();
+}catch(e){st.textContent='✕ '+e.message;st.className='status err'}finally{btn.disabled=false}});
+</script></body></html>

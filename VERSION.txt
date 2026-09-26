@@ -1,0 +1,8 @@
+BERLIN X PANEL — BULK LARGE-RESPONSE ADVANCED v3.0
+
+Main panel: preserved.
+Admin dashboard: preserved.
+Bulk checker: persistent background URL health checks.
+Large-response handling: bounded Firebase probe using limitToFirst=1; complete RTDB payloads are never downloaded.
+Safety ceiling: 64 KiB probe-response buffer.
+Input: TXT/CSV, including URL,SECRET_KEY format; credential column remains ignored by the bulk health worker.

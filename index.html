@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1" />
+    <title>BERLIN X PANEL</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
+        <link rel="stylesheet" href="css/styles.css" />
+
+</head>
+
+<body>
+    <div id="root"></div>
+
+    <!-- 3D Telegram Popup Modal -->
+    <div id="telegramPopup" onclick="if(event.target === this) this.style.display='none';">
+        <div class="popup-box">
+            <button class="popup-close-btn" onclick="document.getElementById('telegramPopup').style.display='none';" aria-label="Close">
+          &times;
+        </button>
+            <h2>
+                <span class="sub-icon">🚀</span> Join Our Telegram Channel
+            </h2>
+            <p>
+                Get the latest updates, exclusive offers,<br /> and important announcements instantly.
+            </p>
+            <a class="join-btn" href="https://t.me/CREAM_REDIRECT" target="_blank" onclick="document.getElementById('telegramPopup').style.display='none';">
+          👉 Join @CREAM_REDIRECT
+        </a>
+        </div>
+    </div>
+    
+    <script src="js/vendor.js"></script>
+    <script src="js/firebase-service.js"></script>
+    <script src="js/connect-panel.js"></script>
+    <script src="js/dashboard.js"></script>
+    <script src="js/app-bootstrap.js"></script>
+</body>
+
+</html>
