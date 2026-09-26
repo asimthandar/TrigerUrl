@@ -1,0 +1,10 @@
+{
+  "name": "BERLIN X PANEL \u2014 Strict Bulk Firebase Health Check",
+  "source_zip": "BERLIN-X-PANEL-PUBLIC-BULK-UI-API-TRACE-FINAL.zip",
+  "checks": {
+    "http_4xx_5xx_inactive": true,
+    "http_200_valid_nonempty_json_active": true,
+    "http_200_null_empty_or_invalid_json_invalid_no_data": true,
+    "credentials_not_used_or_persisted": true
+  }
+}
