@@ -1,0 +1,12 @@
+# BERLIN X PANEL — VALID FIREBASE URLs
+# Generated : 2026-09-26 13:42:57
+# Window    : last 1800s
+# Total     : 5
+#
+# Format: <url>  [#job_id] [source]
+
+https://whithex-741e0-default-rtdb.firebaseio.com  #job365 [public-bulk]
+https://blrm-c65dd-default-rtdb.firebaseio.com  #job365 [public-bulk]
+https://jdjfjiiii-default-rtdb.firebaseio.com  #job365 [public-bulk]
+https://jamesbondd5-default-rtdb.firebaseio.com  #job365 [public-bulk]
+https://sanjay-16691-default-rtdb.firebaseio.com  #job365 [public-bulk]
