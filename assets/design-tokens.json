@@ -1,0 +1,70 @@
+{
+  "meta": {
+    "name": "BERLIN X PANEL UI System",
+    "version": "1.0.0",
+    "source": "UI/UX Pro Max skill principles"
+  },
+  "primitive": {
+    "color": {
+      "bg": "#070A0F",
+      "surface": "#0E131B",
+      "surface2": "#151C27",
+      "border": "#263244",
+      "text": "#F7F9FC",
+      "muted": "#9AA6B8",
+      "primary": "#60A5FA",
+      "success": "#34D399",
+      "warning": "#FBBF24",
+      "danger": "#F87171"
+    },
+    "radius": {
+      "sm": "8px",
+      "md": "12px",
+      "lg": "16px",
+      "xl": "24px"
+    },
+    "space": {
+      "1": "4px",
+      "2": "8px",
+      "3": "12px",
+      "4": "16px",
+      "5": "20px",
+      "6": "24px",
+      "8": "32px",
+      "10": "40px"
+    },
+    "type": {
+      "body": "16px",
+      "small": "14px",
+      "label": "13px",
+      "h1": "30px",
+      "h2": "24px"
+    }
+  },
+  "semantic": {
+    "bg": "var(--color-bg)",
+    "surface": "var(--color-surface)",
+    "surface-elevated": "var(--color-surface-2)",
+    "text": "var(--color-text)",
+    "text-muted": "var(--color-muted)",
+    "interactive": "var(--color-primary)",
+    "focus": "var(--color-primary)",
+    "danger": "var(--color-danger)",
+    "success": "var(--color-success)"
+  },
+  "component": {
+    "button": {
+      "min-height": "44px",
+      "radius": "var(--radius-md)",
+      "focus-ring": "0 0 0 3px color-mix(in srgb, var(--focus) 35%, transparent)"
+    },
+    "input": {
+      "min-height": "44px",
+      "radius": "var(--radius-md)"
+    },
+    "card": {
+      "radius": "var(--radius-lg)",
+      "border": "1px solid var(--color-border)"
+    }
+  }
+}

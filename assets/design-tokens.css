@@ -1,0 +1,8 @@
+:root{
+  --color-bg:#070A0F;--color-surface:#0E131B;--color-surface-2:#151C27;--color-border:#263244;
+  --color-text:#F7F9FC;--color-muted:#9AA6B8;--color-primary:#60A5FA;--color-success:#34D399;
+  --color-warning:#FBBF24;--color-danger:#F87171;
+  --radius-sm:8px;--radius-md:12px;--radius-lg:16px;--radius-xl:24px;
+  --space-1:4px;--space-2:8px;--space-3:12px;--space-4:16px;--space-5:20px;--space-6:24px;--space-8:32px;--space-10:40px;
+  --focus:var(--color-primary);
+}
